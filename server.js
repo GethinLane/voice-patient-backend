@@ -57,9 +57,12 @@ Do NOT explain medical theory, only how you feel and what you notice.
                 type: "audio/pcm",
                 rate: 24000
               },
-              turn_detection: {
-                type: "server_vad"
-              }
+    turn_detection: {
+      type: "server_vad",
+      threshold: 0.5,
+      prefix_padding_ms: 200,
+      silence_duration_ms: 400
+    }
             },
             output: {
               format: {
