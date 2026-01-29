@@ -1,15 +1,46 @@
 // server.js
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
+import "dotenv/config";
+import fs from "fs";
+import http from "http";
+import express from "express";
+import cors from "cors";
+import { WebSocketServer } from "ws";
 
-const app = express();
+import { SpeechClient } from "@google-cloud/speech";
+import textToSpeech from "@google-cloud/text-to-speech";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
 const PORT = process.env.PORT || 3001;
 
+// ---- Load Google service account JSON from env ----
+if (!process.env.GOOGLE_CREDENTIALS_JSON) {
+  throw new Error("Missing GOOGLE_CREDENTIALS_JSON env var (paste your service account JSON).");
+}
+fs.writeFileSync("/tmp/google-creds.json", process.env.GOOGLE_CREDENTIALS_JSON);
+process.env.GOOGLE_APPLICATION_CREDENTIALS = "/tmp/google-creds.json";
+
+// ---- Gemini key (AI Studio key) ----
+if (!process.env.GEMINI_API_KEY) {
+  throw new Error("Missing GEMINI_API_KEY env var (from Google AI Studio).");
+}
+
+const app = express();
 app.use(cors());
 app.use(express.json());
+app.get("/", (_req, res) => res.send("OK"));
 
-// Shared behaviour rules for this case
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+// Clients
+const speechClient = new SpeechClient();
+const ttsClient = new textToSpeech.TextToSpeechClient();
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Use a fast model. If your account doesn’t have this exact name, switch to the one you see in AI Studio.
+const gemini = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
+
+// --- Shared behaviour rules (your existing prompt, reused) ---
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -49,7 +80,6 @@ GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
    - These behaviour rules are CRITICAL. If you are unsure whether to say something extra, it is safer to say nothing unless asked directly.
 `.trim();
 
-// Single case: anxious chest pain – persona + case details
 const PERSONA = `
 You are a 42-year-old patient called Sam.
 You speak with a soft Northern English accent.
@@ -109,71 +139,163 @@ You MUST ONLY use information from these case details when answering questions.
 If something is not written here, you do not know it.
 `.trim();
 
-// POST /api/client-secret
-// Returns a short-lived client secret for the Realtime API
-app.post("/api/client-secret", async (req, res) => {
-  try {
-    // You *could* still read req.body.scenario, but we ignore it and always use this one case.
-    const fullInstructions = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
+function sendJSON(ws, obj) {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+}
 
-    // Call OpenAI to create a Realtime client secret
-    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        expires_after: {
-          anchor: "created_at",
-          seconds: 600 // token valid for 10 minutes
+function buildPrompt(history, scenarioName) {
+  const system = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`.trim();
+  const convo = history
+    .slice(-12)
+    .map((h) => `${h.role.toUpperCase()}: ${h.text}`)
+    .join("\n");
+
+  return `
+SYSTEM:
+${system}
+
+SCENARIO:
+${scenarioName}
+
+CONVERSATION:
+${convo}
+
+ASSISTANT:
+`.trim();
+}
+
+wss.on("connection", (ws) => {
+  let recognizeStream = null;
+  let started = false;
+
+  // Config defaults (can be overridden by client "start" message)
+  let scenario = "anxious-chest-pain";
+  let sttLanguageCode = "en-GB";
+  let ttsLanguageCode = "en-GB";
+  let ttsVoiceName = "en-GB-Neural2-B"; // you can swap to WaveNet/Neural2 etc.
+
+  const history = [];
+
+  function startSTT() {
+    recognizeStream = speechClient
+      .streamingRecognize({
+        config: {
+          encoding: "LINEAR16",
+          sampleRateHertz: 16000,
+          languageCode: sttLanguageCode,
+          enableAutomaticPunctuation: true
         },
-        session: {
-          type: "realtime",
-          model: "gpt-realtime-mini", // or "gpt-realtime" if you want the bigger one
-          instructions: fullInstructions,
-          output_modalities: ["audio"],
-          audio: {
-            input: {
-              format: {
-                type: "audio/pcm",
-                rate: 24000
-              },
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.5,
-                prefix_padding_ms: 200,
-                silence_duration_ms: 400
-              }
-            },
-            output: {
-              format: {
-                type: "audio/pcm",
-                rate: 24000
-              },
-              voice: "alloy",
-              speed: 1.0
-            }
-          }
-        }
-      }),
-    });
+        interimResults: true
+      })
+      .on("error", (err) => {
+        sendJSON(ws, { type: "error", message: "STT error: " + (err.message || err) });
+      })
+      .on("data", async (data) => {
+        const result = data.results?.[0];
+        const alt = result?.alternatives?.[0];
+        const text = alt?.transcript?.trim();
+        if (!text) return;
 
-    if (!response.ok) {
-      const text = await response.text();
-      console.error("Error from OpenAI:", text);
-      return res.status(500).json({ error: "OpenAI client_secret failed", details: text });
+        if (!result.isFinal) {
+          sendJSON(ws, { type: "partial_transcript", text });
+          return;
+        }
+
+        // final transcript
+        sendJSON(ws, { type: "final_transcript", text });
+        history.push({ role: "user", text });
+
+        // LLM response
+        let aiText = "";
+        try {
+          const prompt = buildPrompt(history, scenario);
+          const resp = await gemini.generateContent(prompt);
+          aiText = (resp.response.text() || "").trim();
+          if (!aiText) aiText = "I'm not sure.";
+        } catch (e) {
+          sendJSON(ws, { type: "error", message: "Gemini error: " + (e.message || e) });
+          return;
+        }
+
+        history.push({ role: "assistant", text: aiText });
+        sendJSON(ws, { type: "ai_text", text: aiText });
+
+        // TTS (MP3)
+        try {
+          const [ttsResp] = await ttsClient.synthesizeSpeech({
+            input: { text: aiText },
+            voice: {
+              languageCode: ttsLanguageCode,
+              name: ttsVoiceName
+            },
+            audioConfig: {
+              audioEncoding: "MP3"
+            }
+          });
+
+          if (ttsResp.audioContent) {
+            // binary MP3 bytes
+            ws.send(ttsResp.audioContent);
+          }
+          sendJSON(ws, { type: "ai_done" });
+        } catch (e) {
+          sendJSON(ws, { type: "error", message: "TTS error: " + (e.message || e) });
+        }
+      });
+  }
+
+  ws.on("message", (msg, isBinary) => {
+    // JSON control messages
+    if (!isBinary) {
+      const s = msg.toString();
+
+      if (s.startsWith("{")) {
+        const obj = JSON.parse(s);
+
+        if (obj.type === "start") {
+          started = true;
+
+          if (obj.scenario) scenario = obj.scenario;
+
+          if (obj.stt?.languageCode) sttLanguageCode = obj.stt.languageCode;
+
+          if (obj.tts?.languageCode) ttsLanguageCode = obj.tts.languageCode;
+          if (obj.tts?.voiceName) ttsVoiceName = obj.tts.voiceName;
+
+          history.length = 0;
+
+          try { recognizeStream?.end(); } catch {}
+          recognizeStream = null;
+
+          startSTT();
+          sendJSON(ws, { type: "status", message: "started" });
+          return;
+        }
+
+        if (obj.type === "stop") {
+          started = false;
+          try { recognizeStream?.end(); } catch {}
+          recognizeStream = null;
+          sendJSON(ws, { type: "status", message: "stopped" });
+          return;
+        }
+      }
+
+      return;
     }
 
-    const data = await response.json();
-    // data.value is the ephemeral token (starts with ek_...)
-    res.json({ clientSecret: data.value });
-  } catch (err) {
-    console.error("Server error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
+    // Binary = PCM16 audio chunk
+    if (isBinary && started && recognizeStream) {
+      recognizeStream.write(msg);
+    }
+  });
+
+  ws.on("close", () => {
+    try { recognizeStream?.end(); } catch {}
+    recognizeStream = null;
+  });
 });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Backend listening on port ${PORT}`);
 });
