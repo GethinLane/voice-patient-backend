@@ -127,7 +127,9 @@ const SYSTEM_TEXT = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`
 // IMPORTANT: these are the env var names this server expects:
 const PROJECT = process.env.GOOGLE_CLOUD_PROJECT || null;
 const LOCATION = process.env.GOOGLE_CLOUD_LOCATION || "us-central1";
-const MODEL_ID = process.env.VERTEX_MODEL || "gemini-2.0-flash-live-preview-04-09";
+const MODEL_ID = process.env.VERTEX_MODEL
+  || `projects/${PROJECT}/locations/${LOCATION}/publishers/google/models/gemini-2.0-flash-live-preview-04-09`;
+
 
 // Vertex Live WS endpoint (v1beta1)
 const VERTEX_WS_URL =
