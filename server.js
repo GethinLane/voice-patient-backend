@@ -1,19 +1,23 @@
-// server.js
+// server.js (Vertex AI Gemini Live via WebSockets + OAuth)
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
+const { GoogleAuth } = require("google-auth-library");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Health check
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3001;
 
-// ---------------- Patient scenario ----------------
+// ===================== Your patient scenario =====================
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -40,12 +44,17 @@ GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
    - If the clinician asks you for medical advice, you say you are not qualified and just describe your own experience.
 
 5. Use ONLY the case information (no invention):
-   - You have a fixed set of case details provided in these instructions. Treat these as your entire memory.
-   - You MUST NOT invent or guess new medical facts beyond what is written.
-   - If asked for info NOT specified, say "I'm not sure" / "I don't remember" / "I haven't been told that."
+   - You have a fixed set of case details provided in these instructions (symptoms, history, background, etc.). Treat these as your entire memory.
+   - You MUST NOT invent or guess new medical facts, investigations, timelines, or personal history beyond what is written in the case.
+   - If the clinician asks for information that is NOT specified in the case details, you reply with something like:
+       "I'm not sure," or "I don't remember that," or "I haven't been told that."
+   - If the clinician asks a rude, sexual, offensive, or clearly inappropriate question, you reply with a boundary such as:
+       "I'm not here to discuss that. I'd like to focus on my health problem."
 
 6. If you are unsure:
-   - If unsure whether something is in the case details, assume it is NOT and say you are not sure.
+   - If you are ever unsure whether something is in the case details, you assume it is NOT and you say you are not sure,
+     rather than inventing or guessing.
+   - These behaviour rules are CRITICAL. If you are unsure whether to say something extra, it is safer to say nothing unless asked directly.
 `.trim();
 
 const PERSONA = `
@@ -83,10 +92,12 @@ CASE DETAILS (THIS IS YOUR ENTIRE MEMORY – DO NOT INVENT ANYTHING ELSE):
   - Mild asthma.
   - No known heart disease.
   - No previous heart attacks or angina.
-  - No known high blood pressure, no known high cholesterol.
+  - No known high blood pressure, no known high cholesterol (unless specifically tested in the past and told normal).
 
 - Medications:
   - Salbutamol inhaler as needed.
+  - No regular cardiac medications.
+  - No recent changes in medication.
 
 - Allergies:
   - None known.
@@ -94,23 +105,34 @@ CASE DETAILS (THIS IS YOUR ENTIRE MEMORY – DO NOT INVENT ANYTHING ELSE):
 - Social history:
   - Non-smoker.
   - Drinks alcohol socially, about 6 units per week.
-  - Desk job, generally sedentary.
+  - Desk job, generally sedentary but not completely inactive.
   - Lives with partner.
 
 - Family history:
   - Father had a heart attack in his late 60s.
   - No known sudden cardiac deaths in younger relatives.
+
+You MUST ONLY use information from these case details when answering questions.
+If something is not written here, you do not know it.
 `.trim();
 
 const SYSTEM_INSTRUCTIONS = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
 
-// ---------------- Gemini Live WS ----------------
-// Live WS endpoint (v1beta) :contentReference[oaicite:3]{index=3}
-const GEMINI_WS_BASE =
-  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-
+// ===================== Audio settings =====================
 const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
+
+// ===================== Vertex config =====================
+const VERTEX_PROJECT_ID = process.env.VERTEX_PROJECT_ID;
+const VERTEX_LOCATION = process.env.VERTEX_LOCATION || "us-central1";
+const VERTEX_MODEL_ID =
+  process.env.VERTEX_MODEL_ID || "gemini-2.0-flash-live-preview-04-09";
+
+// Vertex Live WS endpoint (regional)
+function vertexWsUrl(location) {
+  // Vertex Live uses aiplatform regional host + /ws/.../BidiGenerateContent
+  return `wss://${location}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent`;
+}
 
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
@@ -118,227 +140,204 @@ function toBase64(buf) {
 function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
-function wsSendSafe(ws, obj) {
-  try {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  } catch {}
-}
 
-// ---- Model discovery (no curl needed) ----
-// Uses Models API models.list :contentReference[oaicite:4]{index=4}
-async function listModels(apiKey) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url);
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(`models.list failed: HTTP ${res.status} ${JSON.stringify(json)}`);
+// Write service account JSON to disk (Render-friendly) if provided inline
+function ensureGoogleCredsFile() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+
+  const credsPath = path.join("/tmp", "gcp-sa.json");
+  if (!fs.existsSync(credsPath)) {
+    fs.writeFileSync(credsPath, raw, "utf8");
   }
-  return json.models || [];
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = credsPath;
+  return credsPath;
 }
 
-function pickLiveModel(models) {
-  // supportedGenerationMethods includes method names like "generateContent"
-  // Live API method name is "BidiGenerateContent" (Pascal case per docs) :contentReference[oaicite:5]{index=5}
-  const live = models.filter(m =>
-    Array.isArray(m.supportedGenerationMethods) &&
-    m.supportedGenerationMethods.includes("BidiGenerateContent")
-  );
+async function getAccessToken() {
+  ensureGoogleCredsFile();
 
-  // Prefer native audio model if present; otherwise first live-capable model.
-  const preferred = [
-    "models/gemini-2.5-flash-native-audio-preview-12-2025",
-    "models/gemini-2.0-flash-live-001",
-  ];
-
-  for (const want of preferred) {
-    const hit = live.find(m => m.name === want);
-    if (hit) return hit.name;
-  }
-
-  return live[0]?.name || null;
+  const auth = new GoogleAuth({
+    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+  });
+  const client = await auth.getClient();
+  const tokenResponse = await client.getAccessToken();
+  const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
+  if (!token) throw new Error("Failed to obtain Google OAuth access token.");
+  return token;
 }
 
-let cached = { at: 0, models: [], chosen: null, error: null };
-async function refreshModelCache(apiKey) {
-  const now = Date.now();
-  if (cached.chosen && now - cached.at < 10 * 60 * 1000) return cached; // 10 min cache
-
-  try {
-    const models = await listModels(apiKey);
-    const chosen = pickLiveModel(models);
-    cached = { at: now, models, chosen, error: null };
-  } catch (e) {
-    cached = { at: now, models: [], chosen: null, error: e.message };
-  }
-  return cached;
-}
-
-// Debug endpoint to see what your key supports
-app.get("/models", async (_req, res) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
-
-  const data = await refreshModelCache(apiKey);
-  const live = data.models
-    .filter(m => (m.supportedGenerationMethods || []).includes("BidiGenerateContent"))
-    .map(m => ({ name: m.name, baseModelId: m.baseModelId, methods: m.supportedGenerationMethods }));
-
+// Debug endpoint so you can confirm env vars are set
+app.get("/vertex", (_req, res) => {
   res.json({
-    chosenLiveModel: data.chosen,
-    error: data.error,
-    liveModels: live,
+    project: !!VERTEX_PROJECT_ID ? VERTEX_PROJECT_ID : null,
+    location: VERTEX_LOCATION,
+    modelId: VERTEX_MODEL_ID,
+    hasServiceAccountJson: !!process.env.GOOGLE_SERVICE_ACCOUNT_JSON,
   });
 });
 
-// HTTP server so WS shares same port (Render)
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
 wss.on("connection", async (clientWs) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    wsSendSafe(clientWs, { type: "error", message: "Server missing GEMINI_API_KEY env var." });
-    clientWs.close();
-    return;
-  }
+  try {
+    if (!VERTEX_PROJECT_ID) {
+      clientWs.send(JSON.stringify({ type: "error", message: "Missing VERTEX_PROJECT_ID env var." }));
+      clientWs.close();
+      return;
+    }
 
-  // If you set GEMINI_MODEL explicitly, we'll try it, but the cache tells you what's valid.
-  const data = await refreshModelCache(apiKey);
+    const accessToken = await getAccessToken();
+    const url = vertexWsUrl(VERTEX_LOCATION);
 
-  const envModel = process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim();
-  const modelToUse = envModel || data.chosen;
-
-  console.log("BOOT/CONN modelToUse =", modelToUse, "envModel =", envModel, "cacheChosen =", data.chosen, "cacheError =", data.error);
-
-  if (!modelToUse) {
-    wsSendSafe(clientWs, {
-      type: "error",
-      message:
-        "No Live-capable model found for this API key. Open /models on your backend to see what models support BidiGenerateContent.",
-    });
-    clientWs.close();
-    return;
-  }
-
-  const geminiUrl = `${GEMINI_WS_BASE}?key=${encodeURIComponent(apiKey)}`;
-  const geminiWs = new WebSocket(geminiUrl);
-
-  let geminiReady = false;
-
-  geminiWs.on("open", () => {
-    console.log("Gemini WS open -> sending setup with model:", modelToUse);
-
-    const setupMsg = {
-      setup: {
-        model: modelToUse,
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          temperature: 0.7,
-          maxOutputTokens: 512,
-          // speechConfig can be added later once audio is flowing reliably
-        },
-
-        // Keep this Content form because it matched the validator you hit earlier
-        systemInstruction: {
-          role: "system",
-          parts: [{ text: SYSTEM_INSTRUCTIONS }],
-        },
-
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        realtimeInputConfig: {},
+    // Connect to Vertex Live with Authorization header
+    const geminiWs = new WebSocket(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        // This can help in some org setups (safe to include):
+        "x-goog-user-project": VERTEX_PROJECT_ID,
       },
-    };
+    });
 
-    geminiWs.send(JSON.stringify(setupMsg));
-  });
+    let geminiReady = false;
 
-  geminiWs.on("message", (data) => {
-    const msgStr = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-    const msg = safeJsonParse(msgStr);
+    geminiWs.on("open", () => {
+      // IMPORTANT: system_instruction must be a Content object (parts[]), not a string.
+      const setupMsg = {
+        setup: {
+          model: `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL_ID}`,
+          generation_config: {
+            response_modalities: ["AUDIO"],
+            temperature: 0.7,
+            max_output_tokens: 512,
+          },
+          system_instruction: {
+            parts: [{ text: SYSTEM_INSTRUCTIONS }],
+          },
+          input_audio_transcription: {},
+          output_audio_transcription: {},
+        },
+      };
 
-    if (!msg) {
-      wsSendSafe(clientWs, { type: "debug", raw: msgStr.slice(0, 500) });
-      return;
-    }
+      geminiWs.send(JSON.stringify(setupMsg));
+    });
 
-    if (msg.error) {
-      wsSendSafe(clientWs, { type: "error", message: JSON.stringify(msg.error) });
-      return;
-    }
+    geminiWs.on("message", (data) => {
+      const msgStr = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+      const msg = safeJsonParse(msgStr);
 
-    if (msg.setupComplete) {
-      geminiReady = true;
-      wsSendSafe(clientWs, { type: "ready", model: modelToUse, outputRate: OUTPUT_EXPECTED_RATE });
-      return;
-    }
+      if (!msg) {
+        clientWs.send(JSON.stringify({ type: "debug", raw: msgStr.slice(0, 500) }));
+        return;
+      }
 
-    const serverContent = msg.serverContent;
+      if (msg.setupComplete) {
+        geminiReady = true;
+        clientWs.send(JSON.stringify({
+          type: "ready",
+          model: `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL_ID}`,
+          outputRate: OUTPUT_EXPECTED_RATE,
+        }));
+        return;
+      }
 
-    if (serverContent?.inputTranscription?.text) {
-      wsSendSafe(clientWs, { type: "transcript", text: serverContent.inputTranscription.text });
-    }
-    if (serverContent?.outputTranscription?.text) {
-      wsSendSafe(clientWs, { type: "ai_transcript", text: serverContent.outputTranscription.text });
-    }
+      // Transcripts (optional)
+      const inputTx = msg.serverContent?.inputTranscription?.text || msg.server_content?.input_transcription?.text;
+      if (inputTx) clientWs.send(JSON.stringify({ type: "transcript", text: inputTx }));
 
-    if (serverContent?.modelTurn?.parts?.length) {
-      for (const part of serverContent.modelTurn.parts) {
-        if (part.text) wsSendSafe(clientWs, { type: "ai_text", text: part.text });
+      const outputTx = msg.serverContent?.outputTranscription?.text || msg.server_content?.output_transcription?.text;
+      if (outputTx) clientWs.send(JSON.stringify({ type: "ai_transcript", text: outputTx }));
+
+      // Main streamed content
+      const serverContent = msg.serverContent || msg.server_content;
+      const modelTurn = serverContent?.modelTurn || serverContent?.model_turn;
+
+      const parts = modelTurn?.parts || [];
+      for (const part of parts) {
+        if (part.text) {
+          clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
+        }
 
         const inline = part.inlineData || part.inline_data;
         if (inline?.data) {
-          wsSendSafe(clientWs, {
+          clientWs.send(JSON.stringify({
             type: "audio",
             mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
             data: inline.data,
-          });
+          }));
         }
       }
-    }
 
-    if (serverContent?.interrupted) wsSendSafe(clientWs, { type: "interrupted" });
-    if (serverContent?.turnComplete) wsSendSafe(clientWs, { type: "turn_complete" });
-  });
+      if (serverContent?.interrupted) {
+        clientWs.send(JSON.stringify({ type: "interrupted" }));
+      }
+      if (serverContent?.turnComplete || serverContent?.turn_complete) {
+        clientWs.send(JSON.stringify({ type: "turn_complete" }));
+      }
+    });
 
-  geminiWs.on("close", (code, reasonBuf) => {
-    const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString("utf8") : String(reasonBuf || "");
-    wsSendSafe(clientWs, { type: "closed", message: `Gemini WS closed. code=${code} reason=${reason}` });
-    try { clientWs.close(); } catch {}
-  });
+    geminiWs.on("close", (e) => {
+      clientWs.send(JSON.stringify({ type: "closed", message: `Vertex WS closed (${e?.code || ""}) ${e?.reason || ""}` }));
+      clientWs.close();
+    });
 
-  geminiWs.on("error", (err) => {
-    wsSendSafe(clientWs, { type: "error", message: `Gemini WS error: ${err.message}` });
-    try { clientWs.close(); } catch {}
-  });
+    geminiWs.on("error", (err) => {
+      clientWs.send(JSON.stringify({ type: "error", message: `Vertex WS error: ${err.message}` }));
+      clientWs.close();
+    });
 
-  clientWs.on("message", (payload, isBinary) => {
-    if (geminiWs.readyState !== WebSocket.OPEN) return;
-    if (!geminiReady) return;
+    clientWs.on("message", (payload, isBinary) => {
+      if (geminiWs.readyState !== WebSocket.OPEN) return;
+      if (!geminiReady) return;
 
-    if (isBinary) {
-      geminiWs.send(JSON.stringify({
-        realtimeInput: {
-          audio: { mimeType: INPUT_MIME, data: toBase64(payload) },
-        },
-      }));
-      return;
-    }
+      if (isBinary) {
+        // realtime_input/media_chunks is the Vertex Live schema
+        const audioMsg = {
+          realtime_input: {
+            media_chunks: [{
+              mime_type: INPUT_MIME,
+              data: toBase64(payload),
+            }],
+          },
+        };
+        geminiWs.send(JSON.stringify(audioMsg));
+        return;
+      }
 
-    const text = payload.toString("utf8");
-    const msg = safeJsonParse(text);
-    if (!msg) return;
+      const text = payload.toString("utf8");
+      const msg = safeJsonParse(text);
+      if (!msg) return;
 
-    if (msg.type === "text" && typeof msg.text === "string") {
-      geminiWs.send(JSON.stringify({ realtimeInput: { text: msg.text } }));
-    }
-    if (msg.type === "stop_audio") {
-      geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-    }
-  });
+      if (msg.type === "text" && typeof msg.text === "string") {
+        geminiWs.send(JSON.stringify({
+          client_content: {
+            turns: [{ role: "user", parts: [{ text: msg.text }] }],
+            turn_complete: true,
+          },
+        }));
+      }
 
-  clientWs.on("close", () => { try { geminiWs.close(); } catch {} });
-  clientWs.on("error", () => { try { geminiWs.close(); } catch {} });
+      if (msg.type === "stop_audio") {
+        geminiWs.send(JSON.stringify({
+          realtime_input: { audio_stream_end: true },
+        }));
+      }
+    });
+
+    clientWs.on("close", () => {
+      try { geminiWs.close(); } catch {}
+    });
+    clientWs.on("error", () => {
+      try { geminiWs.close(); } catch {}
+    });
+
+  } catch (err) {
+    clientWs.send(JSON.stringify({ type: "error", message: err.message || String(err) }));
+    clientWs.close();
+  }
 });
 
-server.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Backend listening on port ${PORT}`);
+});
