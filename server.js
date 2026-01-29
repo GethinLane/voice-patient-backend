@@ -120,7 +120,8 @@ const GEMINI_WS_BASE =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const DEFAULT_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
+  process.env.GEMINI_MODEL || "models/gemini-2.5-flash-native-audio-preview-12-2025";
+
 
 const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
