@@ -1,47 +1,20 @@
 // server.js
-import "dotenv/config";
-import fs from "fs";
-import http from "http";
-import express from "express";
-import cors from "cors";
-import { WebSocketServer } from "ws";
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const WebSocket = require("ws");
 
-import { SpeechClient } from "@google-cloud/speech";
-import textToSpeech from "@google-cloud/text-to-speech";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-
-const PORT = process.env.PORT || 3001;
-
-// ---- Load Google service account JSON from env (Render) ----
-if (!process.env.GOOGLE_CREDENTIALS_JSON) {
-  throw new Error("Missing GOOGLE_CREDENTIALS_JSON env var (paste your service account JSON).");
-}
-fs.writeFileSync("/tmp/google-creds.json", process.env.GOOGLE_CREDENTIALS_JSON);
-process.env.GOOGLE_APPLICATION_CREDENTIALS = "/tmp/google-creds.json";
-
-// ---- Gemini key (AI Studio key) ----
-if (!process.env.GEMINI_API_KEY) {
-  throw new Error("Missing GEMINI_API_KEY env var (from Google AI Studio).");
-}
-
-// ---- Express app ----
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Health check so Render "/" shows OK
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const PORT = process.env.PORT || 3001;
 
-// ---- Clients ----
-const speechClient = new SpeechClient();
-const ttsClient = new textToSpeech.TextToSpeechClient();
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// If this model name doesn't exist in your account, switch to one you see in AI Studio.
-const gemini = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
-
-// -------------------- PROMPT (your existing content) --------------------
+// --- Your patient scenario (same content you had) ----------------
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -140,185 +113,187 @@ You MUST ONLY use information from these case details when answering questions.
 If something is not written here, you do not know it.
 `.trim();
 
-// -------------------- Helpers --------------------
-function sendJSON(ws, obj) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+const SYSTEM_INSTRUCTIONS = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
+
+// --- Gemini Live API connection details --------------------------
+// Official endpoint (v1beta) from docs :contentReference[oaicite:1]{index=1}
+const GEMINI_WS_BASE =
+  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
+// Model example from Live docs :contentReference[oaicite:2]{index=2}
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
+
+// Input audio should be PCM16 @ 16kHz; output audio is PCM @ 24kHz per docs :contentReference[oaicite:3]{index=3}
+const INPUT_MIME = "audio/pcm;rate=16000";
+const OUTPUT_EXPECTED_RATE = 24000;
+
+// Helpers
+function toBase64(buf) {
+  return Buffer.from(buf).toString("base64");
 }
 
-function buildPrompt(history, scenarioName) {
-  const system = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`.trim();
-  const convo = history
-    .slice(-12)
-    .map((h) => `${h.role.toUpperCase()}: ${h.text}`)
-    .join("\n");
-
-  return `
-SYSTEM:
-${system}
-
-SCENARIO:
-${scenarioName}
-
-CONVERSATION:
-${convo}
-
-ASSISTANT:
-`.trim();
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
 }
 
-// -------------------- WebSocket handling --------------------
-wss.on("connection", (ws) => {
-  let recognizeStream = null;
-  let started = false;
+// Create HTTP server so WS can share same port (Render)
+const server = http.createServer(app);
 
-  // Config (client can override in "start" message)
-  let scenario = "anxious-chest-pain";
-  let sttLanguageCode = "en-GB";
+// WS server: browser connects here
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
-  // Pick a Google TTS voice here (you can change from the client too)
-  let ttsLanguageCode = "en-GB";
-  let ttsVoiceName = "en-GB-Neural2-B";
+wss.on("connection", (clientWs) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    clientWs.send(JSON.stringify({ type: "error", message: "Server missing GEMINI_API_KEY env var." }));
+    clientWs.close();
+    return;
+  }
 
-  const history = [];
+  // Auth: In practice many clients pass the key as a query param for the Live WS endpoint.
+  // (If Google changes this, you may need ephemeral tokens later.) :contentReference[oaicite:4]{index=4}
+  const geminiUrl = `${GEMINI_WS_BASE}?key=${encodeURIComponent(apiKey)}`;
 
-  const safeEndStream = () => {
-    try { recognizeStream?.end(); } catch {}
-    try { recognizeStream?.destroy(); } catch {}
-    recognizeStream = null;
-  };
+  const geminiWs = new WebSocket(geminiUrl);
 
-  const startSTT = () => {
-    safeEndStream();
+  let geminiReady = false;
 
-    recognizeStream = speechClient
-      .streamingRecognize({
-        config: {
-          encoding: "LINEAR16",
-          sampleRateHertz: 16000,
-          languageCode: sttLanguageCode,
-          enableAutomaticPunctuation: true
+  geminiWs.on("open", () => {
+    // First message must be setup/config :contentReference[oaicite:5]{index=5}
+    const setupMsg = {
+      setup: {
+        model: DEFAULT_MODEL,
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          // Optional knobs:
+          temperature: 0.7,
+          maxOutputTokens: 512
+          // speechConfig can be added here if you want voice/language settings
         },
-        interimResults: true
-      })
-      .on("error", (err) => {
-        const msg = String(err?.message || err);
-        sendJSON(ws, { type: "error", message: "STT error: " + msg });
-
-        const isTimeout =
-          msg.includes("Audio Timeout Error") ||
-          msg.toLowerCase().includes("timeout");
-
-        // Stream is dead now; stop writes and optionally restart
-        safeEndStream();
-
-        if (started && isTimeout) {
-          sendJSON(ws, { type: "status", message: "stt_restarting" });
-          setTimeout(() => {
-            if (started) startSTT();
-          }, 250);
-        }
-      })
-      .on("data", async (data) => {
-        const result = data.results?.[0];
-        const alt = result?.alternatives?.[0];
-        const text = alt?.transcript?.trim();
-        if (!text) return;
-
-        if (!result.isFinal) {
-          sendJSON(ws, { type: "partial_transcript", text });
-          return;
-        }
-
-        sendJSON(ws, { type: "final_transcript", text });
-        history.push({ role: "user", text });
-
-        // LLM response
-        let aiText = "";
-        try {
-          const prompt = buildPrompt(history, scenario);
-          const resp = await gemini.generateContent(prompt);
-          aiText = (resp.response.text() || "").trim();
-          if (!aiText) aiText = "I'm not sure.";
-        } catch (e) {
-          sendJSON(ws, { type: "error", message: "Gemini error: " + (e.message || e) });
-          return;
-        }
-
-        history.push({ role: "assistant", text: aiText });
-        sendJSON(ws, { type: "ai_text", text: aiText });
-
-        // TTS (MP3)
-        try {
-          const [ttsResp] = await ttsClient.synthesizeSpeech({
-            input: { text: aiText },
-            voice: {
-              languageCode: ttsLanguageCode,
-              name: ttsVoiceName
-            },
-            audioConfig: { audioEncoding: "MP3" }
-          });
-
-          if (ttsResp.audioContent) {
-            ws.send(ttsResp.audioContent);
-          }
-          sendJSON(ws, { type: "ai_done" });
-        } catch (e) {
-          sendJSON(ws, { type: "error", message: "TTS error: " + (e.message || e) });
-        }
-      });
-
-    // Rotate stream periodically to avoid long-lived stream edge cases
-    setTimeout(() => {
-      if (started) startSTT();
-    }, 4 * 60 * 1000);
-  };
-
-  ws.on("message", (msg, isBinary) => {
-    // Control messages
-    if (!isBinary) {
-      const s = msg.toString();
-      if (s.startsWith("{")) {
-        const obj = JSON.parse(s);
-
-        if (obj.type === "start") {
-          started = true;
-
-          // Config overrides
-          if (obj.scenario) scenario = obj.scenario;
-          if (obj.stt?.languageCode) sttLanguageCode = obj.stt.languageCode;
-          if (obj.tts?.languageCode) ttsLanguageCode = obj.tts.languageCode;
-          if (obj.tts?.voiceName) ttsVoiceName = obj.tts.voiceName;
-
-          history.length = 0;
-          startSTT();
-
-          sendJSON(ws, { type: "status", message: "started" });
-          return;
-        }
-
-        if (obj.type === "stop") {
-          started = false;
-          safeEndStream();
-          sendJSON(ws, { type: "status", message: "stopped" });
-          return;
+        systemInstruction: SYSTEM_INSTRUCTIONS,
+        // Optional: transcripts from input/output audio :contentReference[oaicite:6]{index=6}
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        realtimeInputConfig: {
+          // Leave defaults; Live API supports activity detection/barge-in :contentReference[oaicite:7]{index=7}
         }
       }
+    };
+
+    geminiWs.send(JSON.stringify(setupMsg));
+  });
+
+  geminiWs.on("message", (data) => {
+    const msgStr = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+    const msg = safeJsonParse(msgStr);
+
+    // Some servers send non-JSON (rare) — forward as debug
+    if (!msg) {
+      clientWs.send(JSON.stringify({ type: "debug", raw: msgStr.slice(0, 500) }));
       return;
     }
 
-    // Binary audio: only write if stream exists and isn't destroyed
-    if (started && recognizeStream && !recognizeStream.destroyed) {
-      try {
-        recognizeStream.write(msg);
-      } catch {
-        // If it died between check & write, ignore.
+    // Setup complete
+    if (msg.setupComplete) {
+      geminiReady = true;
+      clientWs.send(JSON.stringify({ type: "ready", model: DEFAULT_MODEL, outputRate: OUTPUT_EXPECTED_RATE }));
+      return;
+    }
+
+    // Transcripts (optional)
+    if (msg.serverContent?.inputTranscription?.text) {
+      clientWs.send(JSON.stringify({ type: "transcript", text: msg.serverContent.inputTranscription.text }));
+    }
+    if (msg.serverContent?.outputTranscription?.text) {
+      clientWs.send(JSON.stringify({ type: "ai_transcript", text: msg.serverContent.outputTranscription.text }));
+    }
+
+    // Main content stream
+    const serverContent = msg.serverContent;
+    if (serverContent?.modelTurn?.parts?.length) {
+      for (const part of serverContent.modelTurn.parts) {
+        // Text part
+        if (part.text) {
+          clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
+        }
+
+        // Audio part (inlineData base64 PCM) :contentReference[oaicite:8]{index=8}
+        const inline = part.inlineData || part.inline_data;
+        if (inline?.data) {
+          clientWs.send(JSON.stringify({
+            type: "audio",
+            mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
+            data: inline.data // already base64 from Gemini
+          }));
+        }
       }
+    }
+
+    // Turn markers
+    if (serverContent?.interrupted) {
+      clientWs.send(JSON.stringify({ type: "interrupted" }));
+    }
+    if (serverContent?.turnComplete) {
+      clientWs.send(JSON.stringify({ type: "turn_complete" }));
     }
   });
 
-  ws.on("close", () => {
-    started = false;
-    safeEndStream();
+  geminiWs.on("close", (e) => {
+    clientWs.send(JSON.stringify({ type: "closed", message: `Gemini WS closed (${e})` }));
+    clientWs.close();
+  });
+
+  geminiWs.on("error", (err) => {
+    clientWs.send(JSON.stringify({ type: "error", message: `Gemini WS error: ${err.message}` }));
+    clientWs.close();
+  });
+
+  // Browser -> Server: binary PCM16 16kHz chunks, or JSON control messages
+  clientWs.on("message", (payload, isBinary) => {
+    if (geminiWs.readyState !== WebSocket.OPEN) return;
+
+    if (!geminiReady) {
+      // allow buffering? simplest: ignore until setupComplete
+      return;
+    }
+
+    if (isBinary) {
+      // Forward audio chunk as realtimeInput.audio blob
+      const audioMsg = {
+        realtimeInput: {
+          audio: {
+            mimeType: INPUT_MIME,
+            data: toBase64(payload)
+          }
+        }
+      };
+      geminiWs.send(JSON.stringify(audioMsg));
+      return;
+    }
+
+    // Text JSON messages from client (optional)
+    const text = payload.toString("utf8");
+    const msg = safeJsonParse(text);
+    if (!msg) return;
+
+    if (msg.type === "text" && typeof msg.text === "string") {
+      geminiWs.send(JSON.stringify({
+        realtimeInput: { text: msg.text }
+      }));
+    }
+
+    if (msg.type === "stop_audio") {
+      // Notify Gemini audio stream ended :contentReference[oaicite:9]{index=9}
+      geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    }
+  });
+
+  clientWs.on("close", () => {
+    try { geminiWs.close(); } catch {}
+  });
+
+  clientWs.on("error", () => {
+    try { geminiWs.close(); } catch {}
   });
 });
 
