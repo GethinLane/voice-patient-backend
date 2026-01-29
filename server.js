@@ -1,12 +1,12 @@
-// server.js (Vertex AI Gemini Live via WebSockets + OAuth)
+// server.js (Vertex AI Live WebSocket proxy)
 require("dotenv").config();
-const fs = require("fs");
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
 const { GoogleAuth } = require("google-auth-library");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -17,7 +17,7 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3001;
 
-// ===================== Your patient scenario =====================
+// -------------------- Scenario / System Instruction --------------------
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -116,23 +116,19 @@ You MUST ONLY use information from these case details when answering questions.
 If something is not written here, you do not know it.
 `.trim();
 
-const SYSTEM_INSTRUCTIONS = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
+const SYSTEM_TEXT = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
 
-// ===================== Audio settings =====================
+// -------------------- Vertex Live config --------------------
+const PROJECT = process.env.GOOGLE_CLOUD_PROJECT;
+const LOCATION = process.env.GOOGLE_CLOUD_LOCATION || "us-central1";
+const DEFAULT_MODEL = process.env.VERTEX_MODEL || "gemini-2.0-flash-live-preview-04-09";
+
+// Vertex Live WS endpoint format (v1beta1)
+const VERTEX_WS_URL = `wss://${LOCATION}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent`;
+
+// Audio formats: your frontend sends PCM16 @ 16kHz; model audio output commonly PCM16 @ 24kHz
 const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
-
-// ===================== Vertex config =====================
-const VERTEX_PROJECT_ID = process.env.VERTEX_PROJECT_ID;
-const VERTEX_LOCATION = process.env.VERTEX_LOCATION || "us-central1";
-const VERTEX_MODEL_ID =
-  process.env.VERTEX_MODEL_ID || "gemini-2.0-flash-live-preview-04-09";
-
-// Vertex Live WS endpoint (regional)
-function vertexWsUrl(location) {
-  // Vertex Live uses aiplatform regional host + /ws/.../BidiGenerateContent
-  return `wss://${location}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent`;
-}
 
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
@@ -141,89 +137,130 @@ function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-// Write service account JSON to disk (Render-friendly) if provided inline
-function ensureGoogleCredsFile() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) return null;
+// -------------------- Credentials helper --------------------
+function maybeWriteCredentialsFileFromEnv() {
+  const b64 = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64;
+  if (!b64) return null;
 
-  const credsPath = path.join("/tmp", "gcp-sa.json");
-  if (!fs.existsSync(credsPath)) {
-    fs.writeFileSync(credsPath, raw, "utf8");
-  }
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = credsPath;
-  return credsPath;
+  const jsonStr = Buffer.from(b64, "base64").toString("utf8");
+  const credPath = path.join("/tmp", "gcp-sa.json");
+  fs.writeFileSync(credPath, jsonStr, "utf8");
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
+  return credPath;
 }
 
 async function getAccessToken() {
-  ensureGoogleCredsFile();
+  // If user supplied SA JSON as base64, write it to a file for ADC
+  maybeWriteCredentialsFileFromEnv();
 
   const auth = new GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/cloud-platform"],
   });
+
   const client = await auth.getClient();
   const tokenResponse = await client.getAccessToken();
   const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
-  if (!token) throw new Error("Failed to obtain Google OAuth access token.");
+
+  if (!token) throw new Error("Failed to acquire Google Cloud access token (ADC/service account).");
   return token;
 }
 
-// Debug endpoint so you can confirm env vars are set
+// Debug endpoint so you can sanity-check env vars on Render (doesn't leak secrets)
 app.get("/vertex", (_req, res) => {
   res.json({
-    project: !!VERTEX_PROJECT_ID ? VERTEX_PROJECT_ID : null,
-    location: VERTEX_LOCATION,
-    modelId: VERTEX_MODEL_ID,
-    hasServiceAccountJson: !!process.env.GOOGLE_SERVICE_ACCOUNT_JSON,
+    ok: true,
+    project: PROJECT ? "[set]" : null,
+    location: LOCATION,
+    model: DEFAULT_MODEL,
+    wsEndpoint: VERTEX_WS_URL,
+    credsFromEnvB64: !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64,
+    credsPathSet: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
   });
 });
 
+// Optional: list Model Garden publisher models (handy to verify “live” exists)
+app.get("/models", async (_req, res) => {
+  try {
+    const token = await getAccessToken();
+    // Model Garden list endpoint: publishers.models.list (v1beta1)
+    // https://{service-endpoint}/v1beta1/{parent}/models  where parent=publishers/google
+    // (Docs: publishers.models.list) :contentReference[oaicite:4]{index=4}
+    const url = `https://${LOCATION}-aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=200`;
+
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "x-goog-user-project": PROJECT || "",
+      },
+    });
+    const text = await r.text();
+    res.status(r.status).type("application/json").send(text);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// -------------------- WS proxy (browser -> backend -> Vertex Live) --------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
 wss.on("connection", async (clientWs) => {
+  if (!PROJECT) {
+    clientWs.send(JSON.stringify({ type: "error", message: "Missing GOOGLE_CLOUD_PROJECT env var." }));
+    clientWs.close();
+    return;
+  }
+
+  let vertexWs;
+  let vertexReady = false;
+
   try {
-    if (!VERTEX_PROJECT_ID) {
-      clientWs.send(JSON.stringify({ type: "error", message: "Missing VERTEX_PROJECT_ID env var." }));
-      clientWs.close();
-      return;
-    }
+    const token = await getAccessToken();
 
-    const accessToken = await getAccessToken();
-    const url = vertexWsUrl(VERTEX_LOCATION);
-
-    // Connect to Vertex Live with Authorization header
-    const geminiWs = new WebSocket(url, {
+    vertexWs = new WebSocket(VERTEX_WS_URL, {
       headers: {
-        Authorization: `Bearer ${accessToken}`,
-        // This can help in some org setups (safe to include):
-        "x-goog-user-project": VERTEX_PROJECT_ID,
+        Authorization: `Bearer ${token}`,
+        "x-goog-user-project": PROJECT,
       },
     });
 
-    let geminiReady = false;
-
-    geminiWs.on("open", () => {
-      // IMPORTANT: system_instruction must be a Content object (parts[]), not a string.
-      const setupMsg = {
-        setup: {
-          model: `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL_ID}`,
-          generation_config: {
-            response_modalities: ["AUDIO"],
-            temperature: 0.7,
-            max_output_tokens: 512,
-          },
-          system_instruction: {
-            parts: [{ text: SYSTEM_INSTRUCTIONS }],
-          },
-          input_audio_transcription: {},
-          output_audio_transcription: {},
-        },
-      };
-
-      geminiWs.send(JSON.stringify(setupMsg));
+    // If the handshake fails (401/403/etc), ws emits unexpected-response (THIS is what you need!)
+    vertexWs.on("unexpected-response", (_req, resp) => {
+      const chunks = [];
+      resp.on("data", (c) => chunks.push(c));
+      resp.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8").slice(0, 2000);
+        clientWs.send(JSON.stringify({
+          type: "error",
+          message: `Vertex WS handshake failed: HTTP ${resp.statusCode}. Body: ${body}`,
+        }));
+        try { clientWs.close(); } catch {}
+      });
     });
 
-    geminiWs.on("message", (data) => {
+    vertexWs.on("open", () => {
+      // IMPORTANT: systemInstruction must be a Content object, not a string.
+      const setupMsg = {
+        setup: {
+          model: DEFAULT_MODEL,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            temperature: 0.7,
+            maxOutputTokens: 512,
+          },
+          systemInstruction: {
+            role: "system",
+            parts: [{ text: SYSTEM_TEXT }],
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          realtimeInputConfig: {},
+        },
+      };
+      vertexWs.send(JSON.stringify(setupMsg));
+    });
+
+    vertexWs.on("message", (data) => {
       const msgStr = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       const msg = safeJsonParse(msgStr);
 
@@ -233,75 +270,73 @@ wss.on("connection", async (clientWs) => {
       }
 
       if (msg.setupComplete) {
-        geminiReady = true;
+        vertexReady = true;
         clientWs.send(JSON.stringify({
           type: "ready",
-          model: `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL_ID}`,
+          model: DEFAULT_MODEL,
           outputRate: OUTPUT_EXPECTED_RATE,
         }));
         return;
       }
 
-      // Transcripts (optional)
-      const inputTx = msg.serverContent?.inputTranscription?.text || msg.server_content?.input_transcription?.text;
-      if (inputTx) clientWs.send(JSON.stringify({ type: "transcript", text: inputTx }));
+      const serverContent = msg.serverContent;
+      if (serverContent?.inputTranscription?.text) {
+        clientWs.send(JSON.stringify({ type: "transcript", text: serverContent.inputTranscription.text }));
+      }
+      if (serverContent?.outputTranscription?.text) {
+        clientWs.send(JSON.stringify({ type: "ai_transcript", text: serverContent.outputTranscription.text }));
+      }
 
-      const outputTx = msg.serverContent?.outputTranscription?.text || msg.server_content?.output_transcription?.text;
-      if (outputTx) clientWs.send(JSON.stringify({ type: "ai_transcript", text: outputTx }));
-
-      // Main streamed content
-      const serverContent = msg.serverContent || msg.server_content;
-      const modelTurn = serverContent?.modelTurn || serverContent?.model_turn;
-
-      const parts = modelTurn?.parts || [];
-      for (const part of parts) {
-        if (part.text) {
-          clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
-        }
-
-        const inline = part.inlineData || part.inline_data;
-        if (inline?.data) {
-          clientWs.send(JSON.stringify({
-            type: "audio",
-            mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
-            data: inline.data,
-          }));
+      if (serverContent?.modelTurn?.parts?.length) {
+        for (const part of serverContent.modelTurn.parts) {
+          if (part.text) {
+            clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
+          }
+          const inline = part.inlineData || part.inline_data;
+          if (inline?.data) {
+            clientWs.send(JSON.stringify({
+              type: "audio",
+              mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
+              data: inline.data,
+            }));
+          }
         }
       }
 
-      if (serverContent?.interrupted) {
-        clientWs.send(JSON.stringify({ type: "interrupted" }));
-      }
-      if (serverContent?.turnComplete || serverContent?.turn_complete) {
-        clientWs.send(JSON.stringify({ type: "turn_complete" }));
-      }
+      if (serverContent?.interrupted) clientWs.send(JSON.stringify({ type: "interrupted" }));
+      if (serverContent?.turnComplete) clientWs.send(JSON.stringify({ type: "turn_complete" }));
     });
 
-    geminiWs.on("close", (e) => {
-      clientWs.send(JSON.stringify({ type: "closed", message: `Vertex WS closed (${e?.code || ""}) ${e?.reason || ""}` }));
-      clientWs.close();
+    vertexWs.on("close", (code, reasonBuf) => {
+      const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString("utf8") : String(reasonBuf || "");
+      clientWs.send(JSON.stringify({
+        type: "closed",
+        message: `Vertex WS closed. code=${code} reason=${reason}`,
+      }));
+      try { clientWs.close(); } catch {}
     });
 
-    geminiWs.on("error", (err) => {
+    vertexWs.on("error", (err) => {
       clientWs.send(JSON.stringify({ type: "error", message: `Vertex WS error: ${err.message}` }));
-      clientWs.close();
+      try { clientWs.close(); } catch {}
     });
 
+    // Browser -> backend -> Vertex
     clientWs.on("message", (payload, isBinary) => {
-      if (geminiWs.readyState !== WebSocket.OPEN) return;
-      if (!geminiReady) return;
+      if (!vertexWs || vertexWs.readyState !== WebSocket.OPEN) return;
+      if (!vertexReady) return;
 
       if (isBinary) {
-        // realtime_input/media_chunks is the Vertex Live schema
+        const b64 = toBase64(payload);
+
+        // Send audio chunk (we include BOTH shapes; different deployments have differed)
         const audioMsg = {
-          realtime_input: {
-            media_chunks: [{
-              mime_type: INPUT_MIME,
-              data: toBase64(payload),
-            }],
+          realtimeInput: {
+            audio: { mimeType: INPUT_MIME, data: b64 },
+            mediaChunks: [{ mimeType: INPUT_MIME, data: b64 }],
           },
         };
-        geminiWs.send(JSON.stringify(audioMsg));
+        vertexWs.send(JSON.stringify(audioMsg));
         return;
       }
 
@@ -310,31 +345,24 @@ wss.on("connection", async (clientWs) => {
       if (!msg) return;
 
       if (msg.type === "text" && typeof msg.text === "string") {
-        geminiWs.send(JSON.stringify({
-          client_content: {
-            turns: [{ role: "user", parts: [{ text: msg.text }] }],
-            turn_complete: true,
-          },
-        }));
+        vertexWs.send(JSON.stringify({ realtimeInput: { text: msg.text } }));
       }
 
       if (msg.type === "stop_audio") {
-        geminiWs.send(JSON.stringify({
-          realtime_input: { audio_stream_end: true },
-        }));
+        vertexWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
       }
     });
 
     clientWs.on("close", () => {
-      try { geminiWs.close(); } catch {}
+      try { vertexWs?.close(); } catch {}
     });
     clientWs.on("error", () => {
-      try { geminiWs.close(); } catch {}
+      try { vertexWs?.close(); } catch {}
     });
 
-  } catch (err) {
-    clientWs.send(JSON.stringify({ type: "error", message: err.message || String(err) }));
-    clientWs.close();
+  } catch (e) {
+    clientWs.send(JSON.stringify({ type: "error", message: e.message }));
+    try { clientWs.close(); } catch {}
   }
 });
 
