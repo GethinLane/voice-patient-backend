@@ -9,12 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health check so Render "/" shows OK
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3001;
 
-// --- Patient scenario -------------------------------------------------
+// ---------------- Patient scenario ----------------
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -41,17 +40,12 @@ GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
    - If the clinician asks you for medical advice, you say you are not qualified and just describe your own experience.
 
 5. Use ONLY the case information (no invention):
-   - You have a fixed set of case details provided in these instructions (symptoms, history, background, etc.). Treat these as your entire memory.
-   - You MUST NOT invent or guess new medical facts, investigations, timelines, or personal history beyond what is written in the case.
-   - If the clinician asks for information that is NOT specified in the case details, you reply with something like:
-       "I'm not sure," or "I don't remember that," or "I haven't been told that."
-   - If the clinician asks a rude, sexual, offensive, or clearly inappropriate question, you reply with a boundary such as:
-       "I'm not here to discuss that. I'd like to focus on my health problem."
+   - You have a fixed set of case details provided in these instructions. Treat these as your entire memory.
+   - You MUST NOT invent or guess new medical facts beyond what is written.
+   - If asked for info NOT specified, say "I'm not sure" / "I don't remember" / "I haven't been told that."
 
 6. If you are unsure:
-   - If you are ever unsure whether something is in the case details, you assume it is NOT and you say you are not sure,
-     rather than inventing or guessing.
-   - These behaviour rules are CRITICAL. If you are unsure whether to say something extra, it is safer to say nothing unless asked directly.
+   - If unsure whether something is in the case details, assume it is NOT and say you are not sure.
 `.trim();
 
 const PERSONA = `
@@ -89,12 +83,10 @@ CASE DETAILS (THIS IS YOUR ENTIRE MEMORY – DO NOT INVENT ANYTHING ELSE):
   - Mild asthma.
   - No known heart disease.
   - No previous heart attacks or angina.
-  - No known high blood pressure, no known high cholesterol (unless specifically tested in the past and told normal).
+  - No known high blood pressure, no known high cholesterol.
 
 - Medications:
   - Salbutamol inhaler as needed.
-  - No regular cardiac medications.
-  - No recent changes in medication.
 
 - Allergies:
   - None known.
@@ -102,44 +94,29 @@ CASE DETAILS (THIS IS YOUR ENTIRE MEMORY – DO NOT INVENT ANYTHING ELSE):
 - Social history:
   - Non-smoker.
   - Drinks alcohol socially, about 6 units per week.
-  - Desk job, generally sedentary but not completely inactive.
+  - Desk job, generally sedentary.
   - Lives with partner.
 
 - Family history:
   - Father had a heart attack in his late 60s.
   - No known sudden cardiac deaths in younger relatives.
-
-You MUST ONLY use information from these case details when answering questions.
-If something is not written here, you do not know it.
 `.trim();
 
 const SYSTEM_INSTRUCTIONS = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
 
-// --- Gemini Live WS config ------------------------------------------
+// ---------------- Gemini Live WS ----------------
+// Live WS endpoint (v1beta) :contentReference[oaicite:3]{index=3}
 const GEMINI_WS_BASE =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-
-const DEFAULT_MODEL =
-  process.env.GEMINI_MODEL || "gemini-1.5-flash";
-
-
-
-
-
 
 const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
 
-// Helpers
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
 }
 function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(s); } catch { return null; }
 }
 function wsSendSafe(ws, obj) {
   try {
@@ -147,18 +124,98 @@ function wsSendSafe(ws, obj) {
   } catch {}
 }
 
-// Create HTTP server so WS can share same port (Render)
-const server = http.createServer(app);
+// ---- Model discovery (no curl needed) ----
+// Uses Models API models.list :contentReference[oaicite:4]{index=4}
+async function listModels(apiKey) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!res.ok) {
+    throw new Error(`models.list failed: HTTP ${res.status} ${JSON.stringify(json)}`);
+  }
+  return json.models || [];
+}
 
-// WS server: browser connects here
+function pickLiveModel(models) {
+  // supportedGenerationMethods includes method names like "generateContent"
+  // Live API method name is "BidiGenerateContent" (Pascal case per docs) :contentReference[oaicite:5]{index=5}
+  const live = models.filter(m =>
+    Array.isArray(m.supportedGenerationMethods) &&
+    m.supportedGenerationMethods.includes("BidiGenerateContent")
+  );
+
+  // Prefer native audio model if present; otherwise first live-capable model.
+  const preferred = [
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-2.0-flash-live-001",
+  ];
+
+  for (const want of preferred) {
+    const hit = live.find(m => m.name === want);
+    if (hit) return hit.name;
+  }
+
+  return live[0]?.name || null;
+}
+
+let cached = { at: 0, models: [], chosen: null, error: null };
+async function refreshModelCache(apiKey) {
+  const now = Date.now();
+  if (cached.chosen && now - cached.at < 10 * 60 * 1000) return cached; // 10 min cache
+
+  try {
+    const models = await listModels(apiKey);
+    const chosen = pickLiveModel(models);
+    cached = { at: now, models, chosen, error: null };
+  } catch (e) {
+    cached = { at: now, models: [], chosen: null, error: e.message };
+  }
+  return cached;
+}
+
+// Debug endpoint to see what your key supports
+app.get("/models", async (_req, res) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
+
+  const data = await refreshModelCache(apiKey);
+  const live = data.models
+    .filter(m => (m.supportedGenerationMethods || []).includes("BidiGenerateContent"))
+    .map(m => ({ name: m.name, baseModelId: m.baseModelId, methods: m.supportedGenerationMethods }));
+
+  res.json({
+    chosenLiveModel: data.chosen,
+    error: data.error,
+    liveModels: live,
+  });
+});
+
+// HTTP server so WS shares same port (Render)
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
-wss.on("connection", (clientWs, req) => {
-  console.log("Browser WS connected", req?.socket?.remoteAddress);
-
+wss.on("connection", async (clientWs) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     wsSendSafe(clientWs, { type: "error", message: "Server missing GEMINI_API_KEY env var." });
+    clientWs.close();
+    return;
+  }
+
+  // If you set GEMINI_MODEL explicitly, we'll try it, but the cache tells you what's valid.
+  const data = await refreshModelCache(apiKey);
+
+  const envModel = process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim();
+  const modelToUse = envModel || data.chosen;
+
+  console.log("BOOT/CONN modelToUse =", modelToUse, "envModel =", envModel, "cacheChosen =", data.chosen, "cacheError =", data.error);
+
+  if (!modelToUse) {
+    wsSendSafe(clientWs, {
+      type: "error",
+      message:
+        "No Live-capable model found for this API key. Open /models on your backend to see what models support BidiGenerateContent.",
+    });
     clientWs.close();
     return;
   }
@@ -169,20 +226,23 @@ wss.on("connection", (clientWs, req) => {
   let geminiReady = false;
 
   geminiWs.on("open", () => {
-    console.log("Gemini WS open -> sending setup");
+    console.log("Gemini WS open -> sending setup with model:", modelToUse);
 
     const setupMsg = {
       setup: {
-        model: DEFAULT_MODEL,
+        model: modelToUse,
         generationConfig: {
           responseModalities: ["AUDIO"],
           temperature: 0.7,
           maxOutputTokens: 512,
+          // speechConfig can be added later once audio is flowing reliably
         },
+
+        // Keep this Content form because it matched the validator you hit earlier
         systemInstruction: {
-  role: "system",
-  parts: [{ text: SYSTEM_INSTRUCTIONS }]
-},
+          role: "system",
+          parts: [{ text: SYSTEM_INSTRUCTIONS }],
+        },
 
         inputAudioTranscription: {},
         outputAudioTranscription: {},
@@ -190,110 +250,78 @@ wss.on("connection", (clientWs, req) => {
       },
     };
 
-    try {
-      geminiWs.send(JSON.stringify(setupMsg));
-    } catch (e) {
-      console.error("Failed to send setup:", e);
-      wsSendSafe(clientWs, { type: "error", message: "Failed to send setup to Gemini." });
-      try { clientWs.close(); } catch {}
-    }
+    geminiWs.send(JSON.stringify(setupMsg));
   });
 
   geminiWs.on("message", (data) => {
     const msgStr = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
     const msg = safeJsonParse(msgStr);
 
-    // Sometimes non-JSON; forward a snippet for debugging
     if (!msg) {
-      console.log("Gemini non-JSON:", msgStr.slice(0, 200));
       wsSendSafe(clientWs, { type: "debug", raw: msgStr.slice(0, 500) });
       return;
     }
 
-    // Gemini error payloads (very important to surface)
     if (msg.error) {
-      console.log("Gemini error payload:", msg.error);
       wsSendSafe(clientWs, { type: "error", message: JSON.stringify(msg.error) });
       return;
     }
 
-    // Setup complete
     if (msg.setupComplete) {
       geminiReady = true;
-      console.log("Gemini setupComplete");
-      wsSendSafe(clientWs, {
-        type: "ready",
-        model: DEFAULT_MODEL,
-        outputRate: OUTPUT_EXPECTED_RATE,
-      });
+      wsSendSafe(clientWs, { type: "ready", model: modelToUse, outputRate: OUTPUT_EXPECTED_RATE });
       return;
     }
 
-    // Transcripts (optional)
-    if (msg.serverContent?.inputTranscription?.text) {
-      wsSendSafe(clientWs, { type: "transcript", text: msg.serverContent.inputTranscription.text });
+    const serverContent = msg.serverContent;
+
+    if (serverContent?.inputTranscription?.text) {
+      wsSendSafe(clientWs, { type: "transcript", text: serverContent.inputTranscription.text });
     }
-    if (msg.serverContent?.outputTranscription?.text) {
-      wsSendSafe(clientWs, { type: "ai_transcript", text: msg.serverContent.outputTranscription.text });
+    if (serverContent?.outputTranscription?.text) {
+      wsSendSafe(clientWs, { type: "ai_transcript", text: serverContent.outputTranscription.text });
     }
 
-    // Main content stream
-    const serverContent = msg.serverContent;
     if (serverContent?.modelTurn?.parts?.length) {
       for (const part of serverContent.modelTurn.parts) {
-        if (part.text) {
-          wsSendSafe(clientWs, { type: "ai_text", text: part.text });
-        }
+        if (part.text) wsSendSafe(clientWs, { type: "ai_text", text: part.text });
 
         const inline = part.inlineData || part.inline_data;
         if (inline?.data) {
           wsSendSafe(clientWs, {
             type: "audio",
             mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
-            data: inline.data, // base64 from Gemini
+            data: inline.data,
           });
         }
       }
     }
 
-    // Turn markers
     if (serverContent?.interrupted) wsSendSafe(clientWs, { type: "interrupted" });
     if (serverContent?.turnComplete) wsSendSafe(clientWs, { type: "turn_complete" });
   });
 
   geminiWs.on("close", (code, reasonBuf) => {
     const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString("utf8") : String(reasonBuf || "");
-    console.log("Gemini WS closed:", { code, reason });
-    wsSendSafe(clientWs, {
-      type: "closed",
-      message: `Gemini WS closed. code=${code} reason=${reason}`,
-    });
+    wsSendSafe(clientWs, { type: "closed", message: `Gemini WS closed. code=${code} reason=${reason}` });
     try { clientWs.close(); } catch {}
   });
 
   geminiWs.on("error", (err) => {
-    console.error("Gemini WS error:", err);
     wsSendSafe(clientWs, { type: "error", message: `Gemini WS error: ${err.message}` });
     try { clientWs.close(); } catch {}
   });
 
-  // Browser -> Server: binary PCM16 16kHz chunks, or JSON control messages
   clientWs.on("message", (payload, isBinary) => {
     if (geminiWs.readyState !== WebSocket.OPEN) return;
-
-    // Don’t forward audio/text until setupComplete
     if (!geminiReady) return;
 
     if (isBinary) {
-      const audioMsg = {
+      geminiWs.send(JSON.stringify({
         realtimeInput: {
-          audio: {
-            mimeType: INPUT_MIME,
-            data: toBase64(payload),
-          },
+          audio: { mimeType: INPUT_MIME, data: toBase64(payload) },
         },
-      };
-      try { geminiWs.send(JSON.stringify(audioMsg)); } catch {}
+      }));
       return;
     }
 
@@ -302,29 +330,15 @@ wss.on("connection", (clientWs, req) => {
     if (!msg) return;
 
     if (msg.type === "text" && typeof msg.text === "string") {
-      try {
-        geminiWs.send(JSON.stringify({ realtimeInput: { text: msg.text } }));
-      } catch {}
+      geminiWs.send(JSON.stringify({ realtimeInput: { text: msg.text } }));
     }
-
     if (msg.type === "stop_audio") {
-      try {
-        geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-      } catch {}
+      geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
     }
   });
 
-  clientWs.on("close", () => {
-    console.log("Browser WS closed");
-    try { geminiWs.close(); } catch {}
-  });
-
-  clientWs.on("error", (e) => {
-    console.log("Browser WS error:", e?.message);
-    try { geminiWs.close(); } catch {}
-  });
+  clientWs.on("close", () => { try { geminiWs.close(); } catch {} });
+  clientWs.on("error", () => { try { geminiWs.close(); } catch {} });
 });
 
-server.listen(PORT, () => {
-  console.log(`Backend listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
