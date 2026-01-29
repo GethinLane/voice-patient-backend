@@ -12,7 +12,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const PORT = process.env.PORT || 3001;
 
-// ---- Load Google service account JSON from env ----
+// ---- Load Google service account JSON from env (Render) ----
 if (!process.env.GOOGLE_CREDENTIALS_JSON) {
   throw new Error("Missing GOOGLE_CREDENTIALS_JSON env var (paste your service account JSON).");
 }
@@ -24,23 +24,24 @@ if (!process.env.GEMINI_API_KEY) {
   throw new Error("Missing GEMINI_API_KEY env var (from Google AI Studio).");
 }
 
+// ---- Express app ----
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.get("/", (_req, res) => res.send("OK"));
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// Clients
+// ---- Clients ----
 const speechClient = new SpeechClient();
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Use a fast model. If your account doesn’t have this exact name, switch to the one you see in AI Studio.
+// If this model name doesn't exist in your account, switch to one you see in AI Studio.
 const gemini = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
 
-// --- Shared behaviour rules (your existing prompt, reused) ---
+// -------------------- PROMPT (your existing content) --------------------
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -139,6 +140,7 @@ You MUST ONLY use information from these case details when answering questions.
 If something is not written here, you do not know it.
 `.trim();
 
+// -------------------- Helpers --------------------
 function sendJSON(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
@@ -164,19 +166,30 @@ ASSISTANT:
 `.trim();
 }
 
+// -------------------- WebSocket handling --------------------
 wss.on("connection", (ws) => {
   let recognizeStream = null;
   let started = false;
 
-  // Config defaults (can be overridden by client "start" message)
+  // Config (client can override in "start" message)
   let scenario = "anxious-chest-pain";
   let sttLanguageCode = "en-GB";
+
+  // Pick a Google TTS voice here (you can change from the client too)
   let ttsLanguageCode = "en-GB";
-  let ttsVoiceName = "en-GB-Neural2-B"; // you can swap to WaveNet/Neural2 etc.
+  let ttsVoiceName = "en-GB-Neural2-B";
 
   const history = [];
 
-  function startSTT() {
+  const safeEndStream = () => {
+    try { recognizeStream?.end(); } catch {}
+    try { recognizeStream?.destroy(); } catch {}
+    recognizeStream = null;
+  };
+
+  const startSTT = () => {
+    safeEndStream();
+
     recognizeStream = speechClient
       .streamingRecognize({
         config: {
@@ -188,7 +201,22 @@ wss.on("connection", (ws) => {
         interimResults: true
       })
       .on("error", (err) => {
-        sendJSON(ws, { type: "error", message: "STT error: " + (err.message || err) });
+        const msg = String(err?.message || err);
+        sendJSON(ws, { type: "error", message: "STT error: " + msg });
+
+        const isTimeout =
+          msg.includes("Audio Timeout Error") ||
+          msg.toLowerCase().includes("timeout");
+
+        // Stream is dead now; stop writes and optionally restart
+        safeEndStream();
+
+        if (started && isTimeout) {
+          sendJSON(ws, { type: "status", message: "stt_restarting" });
+          setTimeout(() => {
+            if (started) startSTT();
+          }, 250);
+        }
       })
       .on("data", async (data) => {
         const result = data.results?.[0];
@@ -201,7 +229,6 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        // final transcript
         sendJSON(ws, { type: "final_transcript", text });
         history.push({ role: "user", text });
 
@@ -228,13 +255,10 @@ wss.on("connection", (ws) => {
               languageCode: ttsLanguageCode,
               name: ttsVoiceName
             },
-            audioConfig: {
-              audioEncoding: "MP3"
-            }
+            audioConfig: { audioEncoding: "MP3" }
           });
 
           if (ttsResp.audioContent) {
-            // binary MP3 bytes
             ws.send(ttsResp.audioContent);
           }
           sendJSON(ws, { type: "ai_done" });
@@ -242,57 +266,59 @@ wss.on("connection", (ws) => {
           sendJSON(ws, { type: "error", message: "TTS error: " + (e.message || e) });
         }
       });
-  }
+
+    // Rotate stream periodically to avoid long-lived stream edge cases
+    setTimeout(() => {
+      if (started) startSTT();
+    }, 4 * 60 * 1000);
+  };
 
   ws.on("message", (msg, isBinary) => {
-    // JSON control messages
+    // Control messages
     if (!isBinary) {
       const s = msg.toString();
-
       if (s.startsWith("{")) {
         const obj = JSON.parse(s);
 
         if (obj.type === "start") {
           started = true;
 
+          // Config overrides
           if (obj.scenario) scenario = obj.scenario;
-
           if (obj.stt?.languageCode) sttLanguageCode = obj.stt.languageCode;
-
           if (obj.tts?.languageCode) ttsLanguageCode = obj.tts.languageCode;
           if (obj.tts?.voiceName) ttsVoiceName = obj.tts.voiceName;
 
           history.length = 0;
-
-          try { recognizeStream?.end(); } catch {}
-          recognizeStream = null;
-
           startSTT();
+
           sendJSON(ws, { type: "status", message: "started" });
           return;
         }
 
         if (obj.type === "stop") {
           started = false;
-          try { recognizeStream?.end(); } catch {}
-          recognizeStream = null;
+          safeEndStream();
           sendJSON(ws, { type: "status", message: "stopped" });
           return;
         }
       }
-
       return;
     }
 
-    // Binary = PCM16 audio chunk
-    if (isBinary && started && recognizeStream) {
-      recognizeStream.write(msg);
+    // Binary audio: only write if stream exists and isn't destroyed
+    if (started && recognizeStream && !recognizeStream.destroyed) {
+      try {
+        recognizeStream.write(msg);
+      } catch {
+        // If it died between check & write, ignore.
+      }
     }
   });
 
   ws.on("close", () => {
-    try { recognizeStream?.end(); } catch {}
-    recognizeStream = null;
+    started = false;
+    safeEndStream();
   });
 });
 
