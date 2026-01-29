@@ -1,7 +1,7 @@
 {
   "name": "voice-patient-backend",
-  "version": "2.0.0",
-  "description": "Backend proxy for Gemini Live API (AI Studio) voice patient",
+  "version": "3.0.0",
+  "description": "Backend proxy for Vertex Gemini Live (voice patient)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -13,8 +13,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "google-auth-library": "^9.15.0",
     "ws": "^8.17.1"
   }
-  "google-auth-library": "^9.15.0"
-
 }
