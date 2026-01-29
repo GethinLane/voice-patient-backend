@@ -14,7 +14,7 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3001;
 
-// --- Your patient scenario (same content you had) ----------------
+// --- Patient scenario -------------------------------------------------
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -115,15 +115,13 @@ If something is not written here, you do not know it.
 
 const SYSTEM_INSTRUCTIONS = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
 
-// --- Gemini Live API connection details --------------------------
-// Official endpoint (v1beta) from docs :contentReference[oaicite:1]{index=1}
+// --- Gemini Live WS config ------------------------------------------
 const GEMINI_WS_BASE =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-// Model example from Live docs :contentReference[oaicite:2]{index=2}
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
+const DEFAULT_MODEL =
+  process.env.GEMINI_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
 
-// Input audio should be PCM16 @ 16kHz; output audio is PCM @ 24kHz per docs :contentReference[oaicite:3]{index=3}
 const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
 
@@ -131,9 +129,17 @@ const OUTPUT_EXPECTED_RATE = 24000;
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
 }
-
 function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+function wsSendSafe(ws, obj) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  } catch {}
 }
 
 // Create HTTP server so WS can share same port (Render)
@@ -142,157 +148,170 @@ const server = http.createServer(app);
 // WS server: browser connects here
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
-wss.on("connection", (clientWs) => {
+wss.on("connection", (clientWs, req) => {
+  console.log("Browser WS connected", req?.socket?.remoteAddress);
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    clientWs.send(JSON.stringify({ type: "error", message: "Server missing GEMINI_API_KEY env var." }));
+    wsSendSafe(clientWs, { type: "error", message: "Server missing GEMINI_API_KEY env var." });
     clientWs.close();
     return;
   }
 
-  // Auth: In practice many clients pass the key as a query param for the Live WS endpoint.
-  // (If Google changes this, you may need ephemeral tokens later.) :contentReference[oaicite:4]{index=4}
   const geminiUrl = `${GEMINI_WS_BASE}?key=${encodeURIComponent(apiKey)}`;
-
   const geminiWs = new WebSocket(geminiUrl);
 
   let geminiReady = false;
 
   geminiWs.on("open", () => {
-    // First message must be setup/config :contentReference[oaicite:5]{index=5}
+    console.log("Gemini WS open -> sending setup");
+
     const setupMsg = {
       setup: {
         model: DEFAULT_MODEL,
         generationConfig: {
           responseModalities: ["AUDIO"],
-          // Optional knobs:
           temperature: 0.7,
-          maxOutputTokens: 512
-          // speechConfig can be added here if you want voice/language settings
+          maxOutputTokens: 512,
         },
         systemInstruction: SYSTEM_INSTRUCTIONS,
-        // Optional: transcripts from input/output audio :contentReference[oaicite:6]{index=6}
         inputAudioTranscription: {},
         outputAudioTranscription: {},
-        realtimeInputConfig: {
-          // Leave defaults; Live API supports activity detection/barge-in :contentReference[oaicite:7]{index=7}
-        }
-      }
+        realtimeInputConfig: {},
+      },
     };
 
-    geminiWs.send(JSON.stringify(setupMsg));
+    try {
+      geminiWs.send(JSON.stringify(setupMsg));
+    } catch (e) {
+      console.error("Failed to send setup:", e);
+      wsSendSafe(clientWs, { type: "error", message: "Failed to send setup to Gemini." });
+      try { clientWs.close(); } catch {}
+    }
   });
 
   geminiWs.on("message", (data) => {
     const msgStr = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
     const msg = safeJsonParse(msgStr);
 
-    // Some servers send non-JSON (rare) — forward as debug
+    // Sometimes non-JSON; forward a snippet for debugging
     if (!msg) {
-      clientWs.send(JSON.stringify({ type: "debug", raw: msgStr.slice(0, 500) }));
+      console.log("Gemini non-JSON:", msgStr.slice(0, 200));
+      wsSendSafe(clientWs, { type: "debug", raw: msgStr.slice(0, 500) });
+      return;
+    }
+
+    // Gemini error payloads (very important to surface)
+    if (msg.error) {
+      console.log("Gemini error payload:", msg.error);
+      wsSendSafe(clientWs, { type: "error", message: JSON.stringify(msg.error) });
       return;
     }
 
     // Setup complete
     if (msg.setupComplete) {
       geminiReady = true;
-      clientWs.send(JSON.stringify({ type: "ready", model: DEFAULT_MODEL, outputRate: OUTPUT_EXPECTED_RATE }));
+      console.log("Gemini setupComplete");
+      wsSendSafe(clientWs, {
+        type: "ready",
+        model: DEFAULT_MODEL,
+        outputRate: OUTPUT_EXPECTED_RATE,
+      });
       return;
     }
 
     // Transcripts (optional)
     if (msg.serverContent?.inputTranscription?.text) {
-      clientWs.send(JSON.stringify({ type: "transcript", text: msg.serverContent.inputTranscription.text }));
+      wsSendSafe(clientWs, { type: "transcript", text: msg.serverContent.inputTranscription.text });
     }
     if (msg.serverContent?.outputTranscription?.text) {
-      clientWs.send(JSON.stringify({ type: "ai_transcript", text: msg.serverContent.outputTranscription.text }));
+      wsSendSafe(clientWs, { type: "ai_transcript", text: msg.serverContent.outputTranscription.text });
     }
 
     // Main content stream
     const serverContent = msg.serverContent;
     if (serverContent?.modelTurn?.parts?.length) {
       for (const part of serverContent.modelTurn.parts) {
-        // Text part
         if (part.text) {
-          clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
+          wsSendSafe(clientWs, { type: "ai_text", text: part.text });
         }
 
-        // Audio part (inlineData base64 PCM) :contentReference[oaicite:8]{index=8}
         const inline = part.inlineData || part.inline_data;
         if (inline?.data) {
-          clientWs.send(JSON.stringify({
+          wsSendSafe(clientWs, {
             type: "audio",
             mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
-            data: inline.data // already base64 from Gemini
-          }));
+            data: inline.data, // base64 from Gemini
+          });
         }
       }
     }
 
     // Turn markers
-    if (serverContent?.interrupted) {
-      clientWs.send(JSON.stringify({ type: "interrupted" }));
-    }
-    if (serverContent?.turnComplete) {
-      clientWs.send(JSON.stringify({ type: "turn_complete" }));
-    }
+    if (serverContent?.interrupted) wsSendSafe(clientWs, { type: "interrupted" });
+    if (serverContent?.turnComplete) wsSendSafe(clientWs, { type: "turn_complete" });
   });
 
-  geminiWs.on("close", (e) => {
-    clientWs.send(JSON.stringify({ type: "closed", message: `Gemini WS closed (${e})` }));
-    clientWs.close();
+  geminiWs.on("close", (code, reasonBuf) => {
+    const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString("utf8") : String(reasonBuf || "");
+    console.log("Gemini WS closed:", { code, reason });
+    wsSendSafe(clientWs, {
+      type: "closed",
+      message: `Gemini WS closed. code=${code} reason=${reason}`,
+    });
+    try { clientWs.close(); } catch {}
   });
 
   geminiWs.on("error", (err) => {
-    clientWs.send(JSON.stringify({ type: "error", message: `Gemini WS error: ${err.message}` }));
-    clientWs.close();
+    console.error("Gemini WS error:", err);
+    wsSendSafe(clientWs, { type: "error", message: `Gemini WS error: ${err.message}` });
+    try { clientWs.close(); } catch {}
   });
 
   // Browser -> Server: binary PCM16 16kHz chunks, or JSON control messages
   clientWs.on("message", (payload, isBinary) => {
     if (geminiWs.readyState !== WebSocket.OPEN) return;
 
-    if (!geminiReady) {
-      // allow buffering? simplest: ignore until setupComplete
-      return;
-    }
+    // Don’t forward audio/text until setupComplete
+    if (!geminiReady) return;
 
     if (isBinary) {
-      // Forward audio chunk as realtimeInput.audio blob
       const audioMsg = {
         realtimeInput: {
           audio: {
             mimeType: INPUT_MIME,
-            data: toBase64(payload)
-          }
-        }
+            data: toBase64(payload),
+          },
+        },
       };
-      geminiWs.send(JSON.stringify(audioMsg));
+      try { geminiWs.send(JSON.stringify(audioMsg)); } catch {}
       return;
     }
 
-    // Text JSON messages from client (optional)
     const text = payload.toString("utf8");
     const msg = safeJsonParse(text);
     if (!msg) return;
 
     if (msg.type === "text" && typeof msg.text === "string") {
-      geminiWs.send(JSON.stringify({
-        realtimeInput: { text: msg.text }
-      }));
+      try {
+        geminiWs.send(JSON.stringify({ realtimeInput: { text: msg.text } }));
+      } catch {}
     }
 
     if (msg.type === "stop_audio") {
-      // Notify Gemini audio stream ended :contentReference[oaicite:9]{index=9}
-      geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+      try {
+        geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+      } catch {}
     }
   });
 
   clientWs.on("close", () => {
+    console.log("Browser WS closed");
     try { geminiWs.close(); } catch {}
   });
 
-  clientWs.on("error", () => {
+  clientWs.on("error", (e) => {
+    console.log("Browser WS error:", e?.message);
     try { geminiWs.close(); } catch {}
   });
 });
