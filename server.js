@@ -119,7 +119,9 @@ const SYSTEM_INSTRUCTIONS = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR
 const GEMINI_WS_BASE =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-live-001";
+const DEFAULT_MODEL =
+  process.env.GEMINI_MODEL || "gemini-1.5-flash";
+
 
 
 
