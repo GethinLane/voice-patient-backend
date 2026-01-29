@@ -1,23 +1,28 @@
-// server.js (Vertex AI Live WebSocket proxy)
+// server.js (Vertex AI Gemini Live WebSocket proxy — Render-friendly)
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
 const { GoogleAuth } = require("google-auth-library");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health check
+// -------------------- Health + Debug --------------------
 app.get("/", (_req, res) => res.status(200).send("OK"));
+
+// Version/debug so you can confirm you’re on the right build
+app.get("/version", (_req, res) => {
+  res.json({ backend: "VERTEX_LIVE", time: new Date().toISOString() });
+});
 
 const PORT = process.env.PORT || 3001;
 
-// -------------------- Scenario / System Instruction --------------------
+// -------------------- Scenario / System Instructions --------------------
 const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
@@ -118,18 +123,21 @@ If something is not written here, you do not know it.
 
 const SYSTEM_TEXT = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
 
-// -------------------- Vertex Live config --------------------
-const PROJECT = process.env.GOOGLE_CLOUD_PROJECT;
+// -------------------- Env / Config --------------------
+// IMPORTANT: these are the env var names this server expects:
+const PROJECT = process.env.GOOGLE_CLOUD_PROJECT || null;
 const LOCATION = process.env.GOOGLE_CLOUD_LOCATION || "us-central1";
-const DEFAULT_MODEL = process.env.VERTEX_MODEL || "gemini-2.0-flash-live-preview-04-09";
+const MODEL_ID = process.env.VERTEX_MODEL || "gemini-2.0-flash-live-preview-04-09";
 
-// Vertex Live WS endpoint format (v1beta1)
-const VERTEX_WS_URL = `wss://${LOCATION}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent`;
+// Vertex Live WS endpoint (v1beta1)
+const VERTEX_WS_URL =
+  `wss://${LOCATION}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent`;
 
-// Audio formats: your frontend sends PCM16 @ 16kHz; model audio output commonly PCM16 @ 24kHz
+// Audio formats
 const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
 
+// -------------------- Helpers --------------------
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
 }
@@ -137,21 +145,43 @@ function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-// -------------------- Credentials helper --------------------
-function maybeWriteCredentialsFileFromEnv() {
+// -------------------- Credentials handling (RAW JSON preferred) --------------------
+// Prefer putting the RAW JSON into GOOGLE_CREDENTIALS_JSON in Render.
+// If you *must* use base64, set GOOGLE_APPLICATION_CREDENTIALS_JSON_B64.
+function ensureCredsFile() {
+  const rawJson = process.env.GOOGLE_CREDENTIALS_JSON || process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   const b64 = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64;
-  if (!b64) return null;
 
-  const jsonStr = Buffer.from(b64, "base64").toString("utf8");
+  let jsonStr = null;
+
+  if (rawJson && rawJson.trim()) {
+    jsonStr = rawJson;
+  } else if (b64 && b64.trim()) {
+    jsonStr = Buffer.from(b64.trim(), "base64").toString("utf8");
+  } else {
+    throw new Error(
+      "Missing credentials: set GOOGLE_CREDENTIALS_JSON (preferred) or GOOGLE_APPLICATION_CREDENTIALS_JSON_B64."
+    );
+  }
+
+  const trimmed = jsonStr.trim();
+
+  // Quick sanity check
+  if (!trimmed.startsWith("{")) {
+    throw new Error("Service account JSON is malformed (does not start with '{').");
+  }
+
+  // Validate JSON so we fail loudly with useful errors
+  JSON.parse(trimmed);
+
   const credPath = path.join("/tmp", "gcp-sa.json");
-  fs.writeFileSync(credPath, jsonStr, "utf8");
+  fs.writeFileSync(credPath, trimmed, "utf8");
   process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
   return credPath;
 }
 
 async function getAccessToken() {
-  // If user supplied SA JSON as base64, write it to a file for ADC
-  maybeWriteCredentialsFileFromEnv();
+  ensureCredsFile();
 
   const auth = new GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/cloud-platform"],
@@ -161,46 +191,37 @@ async function getAccessToken() {
   const tokenResponse = await client.getAccessToken();
   const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
 
-  if (!token) throw new Error("Failed to acquire Google Cloud access token (ADC/service account).");
+  if (!token) throw new Error("Failed to acquire Google OAuth access token.");
   return token;
 }
 
-// Debug endpoint so you can sanity-check env vars on Render (doesn't leak secrets)
+// Debug endpoint (does NOT reveal secrets)
 app.get("/vertex", (_req, res) => {
+  let credsFileWritten = false;
+  let credsError = null;
+
+  try {
+    ensureCredsFile();
+    credsFileWritten = true;
+  } catch (e) {
+    credsError = e.message;
+  }
+
   res.json({
     ok: true,
     project: PROJECT ? "[set]" : null,
     location: LOCATION,
-    model: DEFAULT_MODEL,
+    model: MODEL_ID,
     wsEndpoint: VERTEX_WS_URL,
+    credsFromRawJson: !!(process.env.GOOGLE_CREDENTIALS_JSON || process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
     credsFromEnvB64: !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64,
+    credsFileWritten,
     credsPathSet: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    credsError
   });
 });
 
-// Optional: list Model Garden publisher models (handy to verify “live” exists)
-app.get("/models", async (_req, res) => {
-  try {
-    const token = await getAccessToken();
-    // Model Garden list endpoint: publishers.models.list (v1beta1)
-    // https://{service-endpoint}/v1beta1/{parent}/models  where parent=publishers/google
-    // (Docs: publishers.models.list) :contentReference[oaicite:4]{index=4}
-    const url = `https://${LOCATION}-aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=200`;
-
-    const r = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "x-goog-user-project": PROJECT || "",
-      },
-    });
-    const text = await r.text();
-    res.status(r.status).type("application/json").send(text);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// -------------------- WS proxy (browser -> backend -> Vertex Live) --------------------
+// -------------------- Server + Browser WS --------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
@@ -211,20 +232,20 @@ wss.on("connection", async (clientWs) => {
     return;
   }
 
-  let vertexWs;
+  let vertexWs = null;
   let vertexReady = false;
 
   try {
-    const token = await getAccessToken();
+    const accessToken = await getAccessToken();
 
     vertexWs = new WebSocket(VERTEX_WS_URL, {
       headers: {
-        Authorization: `Bearer ${token}`,
-        "x-goog-user-project": PROJECT,
-      },
+        Authorization: `Bearer ${accessToken}`,
+        "x-goog-user-project": PROJECT
+      }
     });
 
-    // If the handshake fails (401/403/etc), ws emits unexpected-response (THIS is what you need!)
+    // If the WS handshake fails (401/403/etc), this event gives the real reason
     vertexWs.on("unexpected-response", (_req, resp) => {
       const chunks = [];
       resp.on("data", (c) => chunks.push(c));
@@ -232,31 +253,32 @@ wss.on("connection", async (clientWs) => {
         const body = Buffer.concat(chunks).toString("utf8").slice(0, 2000);
         clientWs.send(JSON.stringify({
           type: "error",
-          message: `Vertex WS handshake failed: HTTP ${resp.statusCode}. Body: ${body}`,
+          message: `Vertex WS handshake failed: HTTP ${resp.statusCode}. Body: ${body}`
         }));
         try { clientWs.close(); } catch {}
       });
     });
 
     vertexWs.on("open", () => {
-      // IMPORTANT: systemInstruction must be a Content object, not a string.
+      // IMPORTANT: systemInstruction must be a Content object, not a raw string.
       const setupMsg = {
         setup: {
-          model: DEFAULT_MODEL,
+          model: MODEL_ID,
           generationConfig: {
             responseModalities: ["AUDIO"],
             temperature: 0.7,
-            maxOutputTokens: 512,
+            maxOutputTokens: 512
           },
           systemInstruction: {
             role: "system",
-            parts: [{ text: SYSTEM_TEXT }],
+            parts: [{ text: SYSTEM_TEXT }]
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          realtimeInputConfig: {},
-        },
+          realtimeInputConfig: {}
+        }
       };
+
       vertexWs.send(JSON.stringify(setupMsg));
     });
 
@@ -269,17 +291,20 @@ wss.on("connection", async (clientWs) => {
         return;
       }
 
+      // Setup complete
       if (msg.setupComplete) {
         vertexReady = true;
         clientWs.send(JSON.stringify({
           type: "ready",
-          model: DEFAULT_MODEL,
-          outputRate: OUTPUT_EXPECTED_RATE,
+          model: MODEL_ID,
+          outputRate: OUTPUT_EXPECTED_RATE
         }));
         return;
       }
 
       const serverContent = msg.serverContent;
+
+      // Transcripts (optional)
       if (serverContent?.inputTranscription?.text) {
         clientWs.send(JSON.stringify({ type: "transcript", text: serverContent.inputTranscription.text }));
       }
@@ -287,17 +312,19 @@ wss.on("connection", async (clientWs) => {
         clientWs.send(JSON.stringify({ type: "ai_transcript", text: serverContent.outputTranscription.text }));
       }
 
+      // Main output parts
       if (serverContent?.modelTurn?.parts?.length) {
         for (const part of serverContent.modelTurn.parts) {
           if (part.text) {
             clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
           }
+
           const inline = part.inlineData || part.inline_data;
           if (inline?.data) {
             clientWs.send(JSON.stringify({
               type: "audio",
               mimeType: inline.mimeType || inline.mime_type || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
-              data: inline.data,
+              data: inline.data
             }));
           }
         }
@@ -311,7 +338,7 @@ wss.on("connection", async (clientWs) => {
       const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString("utf8") : String(reasonBuf || "");
       clientWs.send(JSON.stringify({
         type: "closed",
-        message: `Vertex WS closed. code=${code} reason=${reason}`,
+        message: `Vertex WS closed. code=${code} reason=${reason}`
       }));
       try { clientWs.close(); } catch {}
     });
@@ -321,7 +348,7 @@ wss.on("connection", async (clientWs) => {
       try { clientWs.close(); } catch {}
     });
 
-    // Browser -> backend -> Vertex
+    // Browser -> Vertex
     clientWs.on("message", (payload, isBinary) => {
       if (!vertexWs || vertexWs.readyState !== WebSocket.OPEN) return;
       if (!vertexReady) return;
@@ -329,14 +356,12 @@ wss.on("connection", async (clientWs) => {
       if (isBinary) {
         const b64 = toBase64(payload);
 
-        // Send audio chunk (we include BOTH shapes; different deployments have differed)
-        const audioMsg = {
+        // Vertex Live “realtimeInput.audio” format (matches your original client->server design)
+        vertexWs.send(JSON.stringify({
           realtimeInput: {
-            audio: { mimeType: INPUT_MIME, data: b64 },
-            mediaChunks: [{ mimeType: INPUT_MIME, data: b64 }],
-          },
-        };
-        vertexWs.send(JSON.stringify(audioMsg));
+            audio: { mimeType: INPUT_MIME, data: b64 }
+          }
+        }));
         return;
       }
 
@@ -360,9 +385,9 @@ wss.on("connection", async (clientWs) => {
       try { vertexWs?.close(); } catch {}
     });
 
-  } catch (e) {
-    clientWs.send(JSON.stringify({ type: "error", message: e.message }));
-    try { clientWs.close(); } catch {}
+  } catch (err) {
+    clientWs.send(JSON.stringify({ type: "error", message: err.message || String(err) }));
+    clientWs.close();
   }
 });
 
