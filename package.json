@@ -1,14 +1,19 @@
 {
   "name": "voice-patient-backend",
   "version": "1.0.0",
-  "description": "Backend for AI voice patient using OpenAI Realtime API",
+  "description": "Backend for AI voice patient using Google STT + Gemini + Google TTS",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "@google-cloud/speech": "^6.6.0",
+    "@google-cloud/text-to-speech": "^5.4.0",
+    "@google/generative-ai": "^0.21.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
   }
 }
