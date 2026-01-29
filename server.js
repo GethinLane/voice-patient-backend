@@ -174,7 +174,11 @@ wss.on("connection", (clientWs, req) => {
           temperature: 0.7,
           maxOutputTokens: 512,
         },
-        systemInstruction: SYSTEM_INSTRUCTIONS,
+        systemInstruction: {
+  role: "system",
+  parts: [{ text: SYSTEM_INSTRUCTIONS }]
+},
+
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         realtimeInputConfig: {},
