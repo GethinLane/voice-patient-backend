@@ -15,4 +15,6 @@
     "express": "^4.19.2",
     "ws": "^8.17.1"
   }
+  "google-auth-library": "^9.15.0"
+
 }
