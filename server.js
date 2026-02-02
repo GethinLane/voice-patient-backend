@@ -322,7 +322,7 @@ const systemText = buildSystemTextFromCase(records);
           model: modelFqn,
           generation_config: {
             response_modalities: ["AUDIO"],
-            temperature: 0.7,
+            temperature: 0.2,
             max_output_tokens: 512,
           },
           system_instruction: {
