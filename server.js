@@ -333,21 +333,14 @@ wss.on("connection", async (clientWs) => {
           input_audio_transcription: {},
           output_audio_transcription: {},
           realtime_input_config: {
-  automatic_activity_detection: {
-    disabled: false,
+automatic_activity_detection: {
+  disabled: false,
+  start_of_speech_sensitivity: "START_SENSITIVITY_LOW",
+  end_of_speech_sensitivity: "END_SENSITIVITY_HIGH",
+  prefix_padding_ms: 50,
+  silence_duration_ms: 250
+}
 
-    // Start conservative on detecting start-of-speech
-    start_of_speech_sensitivity: "low",
-
-    // Be aggressive about deciding you've finished speaking
-    end_of_speech_sensitivity: "high",
-
-    // Keep a little audio before speech starts (prevents clipped first syllable)
-    prefix_padding_ms: 50,
-
-    // The key knob: how long you must be quiet before ending your turn
-    silence_duration_ms: 250
-  }
 },
 
         },
