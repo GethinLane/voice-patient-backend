@@ -1,5 +1,6 @@
 // server.js (Vertex Gemini Live API proxy + Airtable case selector)
-// npm i express cors ws dotenv google-auth-library
+// npm i express cors ws dotenv google-auth-library node-fetch
+// Ensure Node >= 18 (recommended). If not, node-fetch fallback will be used.
 
 require("dotenv").config();
 
@@ -9,17 +10,28 @@ const http = require("http");
 const WebSocket = require("ws");
 const { GoogleAuth } = require("google-auth-library");
 
+// ---- fetch compatibility (Node 18 has global fetch) ----
+let fetchFn = global.fetch;
+async function getFetch() {
+  if (fetchFn) return fetchFn;
+  const mod = await import("node-fetch");
+  fetchFn = mod.default;
+  return fetchFn;
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3001;
 
 // ----------------------- AIRTABLE CONFIG -----------------------
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
+const AIRTABLE_VIEW = process.env.AIRTABLE_VIEW || ""; // e.g. "AI"
 
 function assertAirtableEnv() {
   if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
@@ -37,11 +49,10 @@ function safeJsonParse(s) {
 
 async function airtableFetch(url) {
   assertAirtableEnv();
+  const fetch = await getFetch();
 
   const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-    },
+    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
   });
 
   if (!res.ok) {
@@ -71,18 +82,13 @@ async function listCaseNumbersFromMeta() {
 async function fetchAllCaseRows(caseNumber) {
   const tableName = `Case ${caseNumber}`;
 
-  // Optional: if you create a view in Airtable called "AI" that orders rows correctly,
-  // uncomment the next line and include &view=AI in the URL.
-  // const viewName = "AI";
-
   let offset = null;
   const records = [];
 
   do {
     const params = new URLSearchParams();
     params.set("pageSize", "100");
-    // params.set("view", viewName); // optional if you make a view
-
+    if (AIRTABLE_VIEW) params.set("view", AIRTABLE_VIEW);
     if (offset) params.set("offset", offset);
 
     const url =
@@ -102,8 +108,6 @@ async function fetchAllCaseRows(caseNumber) {
 }
 
 function combineFieldAcrossRows(records, fieldName) {
-  // Airtable returns records in view order (or default order).
-  // We combine non-empty field values in that order.
   const parts = [];
   for (const r of records) {
     const v = r?.fields?.[fieldName];
@@ -115,19 +119,9 @@ function combineFieldAcrossRows(records, fieldName) {
       if (t) parts.push(t);
     }
   }
-  return parts.join("\n\n"); // separate rows clearly
+  return parts.join("\n\n");
 }
 
-
-function fieldStr(fields, name) {
-  const v = fields?.[name];
-  if (v === undefined || v === null) return "";
-  if (typeof v === "string") return v.trim();
-  // If someone later turns a field into array/rich text etc, stringify gently:
-  return String(v).trim();
-}
-
-// Build dynamic patient system text from Airtable fields
 function buildSystemTextFromCase(records) {
   const opening = combineFieldAcrossRows(records, "Opening Sentence");
   const divulgeFreely = combineFieldAcrossRows(records, "Divulge freely");
@@ -135,7 +129,6 @@ function buildSystemTextFromCase(records) {
   const pmhx = combineFieldAcrossRows(records, "PMHx RP");
   const social = combineFieldAcrossRows(records, "Social History");
 
-  // support both spellings
   const family =
     combineFieldAcrossRows(records, "Family Hiostory") ||
     combineFieldAcrossRows(records, "Family History");
@@ -149,8 +142,7 @@ CRITICAL:
 - Only use information explicitly present in the CASE DETAILS below.
 - If something is not stated, say: "I'm not sure" / "I don't remember" / "I haven't been told".
 - NEVER substitute another symptom.
-- NEVER create symptoms
-- Do Not Hallucinate
+- NEVER create symptoms.
 - NEVER swap relatives. If relationship is not explicit, say you're not sure.
 - Answer only what the clinician asks.
 `.trim();
@@ -186,10 +178,10 @@ ${reaction || "[Not provided]"}
   return `${CASE}\n\n${RULES}`;
 }
 
-
 // ----------------------- VERTEX LIVE CONFIG -----------------------
 const VERTEX_PROJECT_ID =
   process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+
 const VERTEX_LOCATION = process.env.VERTEX_LOCATION || "us-central1";
 const VERTEX_MODEL_ID =
   process.env.VERTEX_MODEL_ID || "gemini-live-2.5-flash-native-audio";
@@ -265,11 +257,12 @@ app.get("/vertex", (_req, res) => {
     airtable: {
       baseIdPresent: !!AIRTABLE_BASE_ID,
       apiKeyPresent: !!AIRTABLE_API_KEY,
+      view: AIRTABLE_VIEW || null,
     },
   });
 });
 
-// ----------------------- NEW: LIST AVAILABLE CASES -----------------------
+// ----------------------- LIST AVAILABLE CASES -----------------------
 app.get("/cases", async (_req, res) => {
   try {
     const cases = await listCaseNumbersFromMeta();
@@ -287,28 +280,41 @@ wss.on("connection", async (clientWs) => {
   let vertexWs = null;
   let vertexReady = false;
 
-  // We now wait for init before connecting to Vertex
   let selectedCaseNumber = null;
   let initReceived = false;
 
-  function sendErrorAndClose(message) {
+  const CLIENT_PING_MS = 15000;
+  const VERTEX_PING_MS = 15000;
+
+  function send(type, obj) {
     try {
-      clientWs.send(JSON.stringify({ type: "error", message }));
+      clientWs.send(JSON.stringify({ type, ...obj }));
     } catch {}
+  }
+
+  function sendErrorAndClose(message) {
+    send("error", { message });
     try { clientWs.close(); } catch {}
     try { vertexWs?.close(); } catch {}
   }
+
+  const clientPingTimer = setInterval(() => {
+    try {
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
+    } catch {}
+  }, CLIENT_PING_MS);
+
+  let vertexPingTimer = null;
 
   async function startVertexWithCase(caseNumber) {
     const modelFqn = fullyQualifiedModelName();
     if (!modelFqn) throw new Error("Missing VERTEX_PROJECT_ID/GOOGLE_CLOUD_PROJECT.");
 
     // Fetch case from Airtable
-const { tableName, records } = await fetchAllCaseRows(caseNumber);
-const systemText = buildSystemTextFromCase(records);
+    const { tableName, records } = await fetchAllCaseRows(caseNumber);
+    const systemText = buildSystemTextFromCase(records);
 
-
-    // OAuth token (service account)
+    // OAuth token
     const token = await getAccessToken();
 
     // Connect to Vertex Live WS
@@ -321,7 +327,8 @@ const systemText = buildSystemTextFromCase(records);
         setup: {
           model: modelFqn,
           generation_config: {
-            response_modalities: ["AUDIO"],
+            // Option 4: include TEXT too for debugging
+            response_modalities: ["AUDIO", "TEXT"],
             temperature: 0.2,
             max_output_tokens: 512,
           },
@@ -331,20 +338,25 @@ const systemText = buildSystemTextFromCase(records);
           input_audio_transcription: {},
           output_audio_transcription: {},
           realtime_input_config: {
-automatic_activity_detection: {
-  disabled: false,
-  start_of_speech_sensitivity: "START_SENSITIVITY_LOW",
-  end_of_speech_sensitivity: "END_SENSITIVITY_HIGH",
-  prefix_padding_ms: 50,
-  silence_duration_ms: 250
-}
-
-},
-
+            automatic_activity_detection: {
+              disabled: false,
+              start_of_speech_sensitivity: "START_SENSITIVITY_LOW",
+              end_of_speech_sensitivity: "END_SENSITIVITY_HIGH",
+              prefix_padding_ms: 50,
+              silence_duration_ms: 250,
+            },
+          },
         },
       };
 
       vertexWs.send(JSON.stringify(setupMsg));
+
+      // Keep Vertex alive too
+      vertexPingTimer = setInterval(() => {
+        try {
+          if (vertexWs && vertexWs.readyState === WebSocket.OPEN) vertexWs.ping?.();
+        } catch {}
+      }, VERTEX_PING_MS);
     });
 
     vertexWs.on("message", (data) => {
@@ -352,21 +364,24 @@ automatic_activity_detection: {
       const msg = safeJsonParse(msgStr);
 
       if (!msg) {
-        clientWs.send(JSON.stringify({ type: "debug", raw: msgStr.slice(0, 500) }));
+        send("debug", { raw: msgStr.slice(0, 800) });
         return;
       }
 
       if (msg.setupComplete) {
         vertexReady = true;
-        clientWs.send(JSON.stringify({
-          type: "ready",
+        send("ready", {
           model: modelFqn,
           outputRate: OUTPUT_EXPECTED_RATE,
           caseId: caseNumber,
           caseTable: tableName,
-        }));
+        });
         return;
       }
+
+      // Forward useful non-content signals
+      if (msg.goAway || msg.go_away) send("goaway", { goAway: msg.goAway || msg.go_away });
+      if (msg.usageMetadata || msg.usage_metadata) send("usage", { usage: msg.usageMetadata || msg.usage_metadata });
 
       const serverContent = msg.serverContent || msg.server_content;
 
@@ -374,58 +389,58 @@ automatic_activity_detection: {
       const inTr =
         serverContent?.input_transcription?.text ||
         serverContent?.inputTranscription?.text;
-      if (inTr) clientWs.send(JSON.stringify({ type: "transcript", text: inTr }));
+      if (inTr) send("transcript", { text: inTr });
 
       const outTr =
         serverContent?.output_transcription?.text ||
         serverContent?.outputTranscription?.text;
-      if (outTr) clientWs.send(JSON.stringify({ type: "ai_transcript", text: outTr }));
+      if (outTr) send("ai_transcript", { text: outTr });
 
       // Main streamed parts
       const modelTurn = serverContent?.model_turn || serverContent?.modelTurn;
       const parts = modelTurn?.parts || [];
       for (const part of parts) {
-        if (part.text) {
-          clientWs.send(JSON.stringify({ type: "ai_text", text: part.text }));
-        }
+        if (part.text) send("ai_text", { text: part.text });
 
         const inline = part.inline_data || part.inlineData;
         if (inline?.data) {
-          clientWs.send(JSON.stringify({
-            type: "audio",
+          send("audio", {
             mimeType:
               inline.mime_type ||
               inline.mimeType ||
               `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
             data: inline.data,
-          }));
+          });
         }
       }
 
-      // Turn markers
       const interrupted = serverContent?.interrupted;
       const turnComplete = serverContent?.turn_complete || serverContent?.turnComplete;
-      if (interrupted) clientWs.send(JSON.stringify({ type: "interrupted" }));
-      if (turnComplete) clientWs.send(JSON.stringify({ type: "turn_complete" }));
+      if (interrupted) send("interrupted", {});
+      if (turnComplete) send("turn_complete", {});
     });
 
     vertexWs.on("close", (code, reason) => {
-      clientWs.send(JSON.stringify({
-        type: "closed",
+      if (vertexPingTimer) clearInterval(vertexPingTimer);
+      vertexPingTimer = null;
+
+      send("closed", {
         message: `Vertex WS closed. code=${code} reason=${reason?.toString?.() || ""}`,
-      }));
+      });
       try { clientWs.close(); } catch {}
     });
 
     vertexWs.on("error", (err) => {
+      if (vertexPingTimer) clearInterval(vertexPingTimer);
+      vertexPingTimer = null;
       sendErrorAndClose(`Vertex WS error: ${err.message}`);
     });
   }
 
   // Browser -> Server
   clientWs.on("message", async (payload, isBinary) => {
-    // Block binary audio until init & vertex ready
     if (isBinary) {
+      // Block binary audio until init & vertex ready
       if (!initReceived || !vertexWs || vertexWs.readyState !== WebSocket.OPEN || !vertexReady) return;
 
       const audioMsg = {
@@ -438,7 +453,9 @@ automatic_activity_detection: {
           ],
         },
       };
-      vertexWs.send(JSON.stringify(audioMsg));
+      try {
+        vertexWs.send(JSON.stringify(audioMsg));
+      } catch {}
       return;
     }
 
@@ -446,9 +463,8 @@ automatic_activity_detection: {
     const msg = safeJsonParse(text);
     if (!msg) return;
 
-    // NEW: init message selects case
     if (msg.type === "init") {
-      if (initReceived) return; // ignore repeats
+      if (initReceived) return;
 
       const caseId = Number(msg.caseId);
       if (!Number.isFinite(caseId) || caseId <= 0) {
@@ -467,13 +483,16 @@ automatic_activity_detection: {
       return;
     }
 
-    // Allow stop_audio even before init
+    if (msg.type === "ping") {
+      send("pong", { t: Date.now() });
+      return;
+    }
+
     if (msg.type === "stop_audio") {
       try { vertexWs?.close(); } catch {}
       return;
     }
 
-    // Text chat support (optional) after ready
     if (msg.type === "text" && typeof msg.text === "string") {
       if (!initReceived || !vertexWs || vertexWs.readyState !== WebSocket.OPEN || !vertexReady) return;
 
@@ -483,28 +502,31 @@ automatic_activity_detection: {
           turn_complete: true,
         },
       };
-      vertexWs.send(JSON.stringify(clientContentMsg));
+      try {
+        vertexWs.send(JSON.stringify(clientContentMsg));
+      } catch {}
       return;
     }
   });
 
   clientWs.on("close", () => {
+    clearInterval(clientPingTimer);
+    if (vertexPingTimer) clearInterval(vertexPingTimer);
     try { vertexWs?.close(); } catch {}
   });
 
   clientWs.on("error", () => {
+    clearInterval(clientPingTimer);
+    if (vertexPingTimer) clearInterval(vertexPingTimer);
     try { vertexWs?.close(); } catch {}
   });
 
-  // Gentle reminder if frontend forgets to init
+  // reminder if frontend forgets to init
   setTimeout(() => {
     if (!initReceived) {
-      try {
-        clientWs.send(JSON.stringify({
-          type: "error",
-          message: "No init received. Send {type:'init', caseId:<number>} right after WS open.",
-        }));
-      } catch {}
+      send("error", {
+        message: "No init received. Send {type:'init', caseId:<number>} right after WS open.",
+      });
       try { clientWs.close(); } catch {}
     }
   }, 15000);
