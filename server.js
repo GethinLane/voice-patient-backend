@@ -1,4 +1,4 @@
-// server.js (Vertex Gemini Live API proxy)
+// server.js (Vertex Gemini Live API proxy + Airtable case selector)
 // npm i express cors ws dotenv google-auth-library
 
 require("dotenv").config();
@@ -17,8 +17,95 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3001;
 
-// ----------------------- YOUR PATIENT PROMPT -----------------------
-const SHARED_BEHAVIOUR_RULES = `
+// ----------------------- AIRTABLE CONFIG -----------------------
+const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
+const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
+
+function assertAirtableEnv() {
+  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+    throw new Error("Missing AIRTABLE_API_KEY or AIRTABLE_BASE_ID in environment.");
+  }
+}
+
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+async function airtableFetch(url) {
+  assertAirtableEnv();
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_API_KEY}`,
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Airtable error ${res.status}: ${text.slice(0, 400)}`);
+  }
+  return res.json();
+}
+
+// List tables in base and extract Case numbers from names like "Case 194"
+async function listCaseNumbersFromMeta() {
+  const url = `https://api.airtable.com/v0/meta/bases/${AIRTABLE_BASE_ID}/tables`;
+  const json = await airtableFetch(url);
+
+  const tableNames = (json.tables || []).map((t) => t.name);
+  const nums = tableNames
+    .map((name) => {
+      const m = /^Case\s+(\d+)$/i.exec(String(name).trim());
+      return m ? Number(m[1]) : null;
+    })
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
+
+  return nums;
+}
+
+// Fetch first record from table "Case X"
+async function fetchCaseRecord(caseNumber) {
+  const tableName = `Case ${caseNumber}`;
+  const url =
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/` +
+    `${encodeURIComponent(tableName)}?pageSize=1`;
+
+  const json = await airtableFetch(url);
+  const rec = (json.records || [])[0];
+  if (!rec || !rec.fields) {
+    throw new Error(`No records found in Airtable table "${tableName}".`);
+  }
+  return { tableName, recordId: rec.id, fields: rec.fields };
+}
+
+function fieldStr(fields, name) {
+  const v = fields?.[name];
+  if (v === undefined || v === null) return "";
+  if (typeof v === "string") return v.trim();
+  // If someone later turns a field into array/rich text etc, stringify gently:
+  return String(v).trim();
+}
+
+// Build dynamic patient system text from Airtable fields
+function buildSystemTextFromCase(fields) {
+  // Supports your typo and a corrected version, just in case
+  const family =
+    fieldStr(fields, "Family Hiostory") || fieldStr(fields, "Family History");
+
+  const opening = fieldStr(fields, "Opening Sentence");
+  const divulgeFreely = fieldStr(fields, "Divulge freely");
+  const divulgeAsked = fieldStr(fields, "Divulge Asked");
+  const pmhx = fieldStr(fields, "PMHx RP");
+  const social = fieldStr(fields, "Social History");
+  const ice = fieldStr(fields, "ICE");
+  const reaction = fieldStr(fields, "Reaction");
+
+  const SHARED_BEHAVIOUR_RULES = `
 GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 
 1. Asking questions:
@@ -27,7 +114,7 @@ GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
    - You never speak as though you are the clinician or give advice or instructions to the clinician.
 
 2. Worries and concerns:
-   - If you mention a worry or concern (for example, fear of cancer or heart attack) and the clinician clearly acknowledges and addresses it,
+   - If you mention a worry or concern and the clinician clearly acknowledges and addresses it,
      you consider that concern handled.
    - After it has been addressed once, you do NOT bring that worry up again unless the clinician directly asks you about it.
 
@@ -35,18 +122,25 @@ GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
    - You ONLY give information in direct response to questions the clinician asks.
    - You do NOT volunteer extra information unprompted.
    - Your answers are brief, focused monologues: usually 1–3 sentences, directly answering the question.
-   - If you are not asked about something, you do not mention it.
    - If the clinician asks a very broad question (like "Tell me more about that"), you can expand slightly but still stay concise.
+
+   IMPORTANT SPECIAL RULE FOR THIS SIMULATION:
+   - If the clinician asks an OPEN question at the start (e.g. "Tell me what's been happening"),
+     you may include BOTH:
+       (a) the Opening Sentence, and
+       (b) key points from "Divulge freely".
+   - Otherwise, stick to only answering what was asked.
 
 4. Role boundaries:
    - You are a patient, not a clinician.
    - You never give medical explanations, diagnoses, or management plans.
+   - You do not ask questions unless specifically instructed to do so.
    - If the clinician asks you for medical advice, you say you are not qualified and just describe your own experience.
 
 5. Use ONLY the case information (no invention):
-   - You have a fixed set of case details provided in these instructions (symptoms, history, background, etc.). Treat these as your entire memory.
-   - You MUST NOT invent or guess new medical facts, investigations, timelines, or personal history beyond what is written in the case.
-   - If the clinician asks for information that is NOT specified in the case details, you reply with something like:
+   - You have a fixed set of case details provided in these instructions. Treat these as your entire memory.
+   - You MUST NOT invent or guess new medical facts, investigations, timelines, or personal history beyond what is written.
+   - If the clinician asks for information that is NOT specified, you reply:
        "I'm not sure," or "I don't remember that," or "I haven't been told that."
    - If the clinician asks a rude, sexual, offensive, or clearly inappropriate question, you reply with a boundary such as:
        "I'm not here to discuss that. I'd like to focus on my health problem."
@@ -54,76 +148,50 @@ GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
 6. If you are unsure:
    - If you are ever unsure whether something is in the case details, you assume it is NOT and you say you are not sure,
      rather than inventing or guessing.
-   - These behaviour rules are CRITICAL. If you are unsure whether to say something extra, it is safer to say nothing unless asked directly.
 `.trim();
 
-const PERSONA = `
-You are a 42-year-old patient called Sam.
-You speak with a soft Northern English accent.
-Your tone is anxious but not aggressive; you sound worried and a bit breathless.
-You are attending a consultation because of chest discomfort.
-You are polite and cooperative.
+  // Keep your persona simple; your "Reaction" field can override behaviour/tone
+  const PERSONA = `
+You are the patient in a medical consultation.
+You speak naturally (UK English).
+You sound like a real person: not robotic, not overly verbose.
 `.trim();
 
-const CASE_DETAILS = `
+  const CASE_DETAILS = `
 CASE DETAILS (THIS IS YOUR ENTIRE MEMORY – DO NOT INVENT ANYTHING ELSE):
 
-- Presenting complaint:
-  - Central chest tightness for the last 2 hours.
-  - Came on at rest while you were watching TV.
-  - Pain has been fairly constant since, maybe slightly easing now.
+OPENING SENTENCE:
+${opening || "[Not provided]"}
 
-- Character of pain:
-  - Feels like a tight band across the centre of your chest.
-  - Does not clearly radiate to your arm or jaw.
+DIVULGE FREELY (can be included when asked broad/open questions):
+${divulgeFreely || "[Not provided]"}
 
-- Associated symptoms:
-  - Mild shortness of breath because you feel anxious.
-  - No sweating.
-  - No nausea or vomiting.
-  - No palpitations.
+DIVULGE ONLY IF ASKED SPECIFICALLY:
+${divulgeAsked || "[Not provided]"}
 
-- Aggravating/relieving factors:
-  - Not clearly worse on exertion.
-  - Not obviously related to breathing or movement.
-  - You have not tried any medication yet.
+PAST MEDICAL HISTORY (ONLY IF ASKED):
+${pmhx || "[Not provided]"}
 
-- Past medical history:
-  - Mild asthma.
-  - No known heart disease.
-  - No previous heart attacks or angina.
-  - No known high blood pressure, no known high cholesterol (unless specifically tested in the past and told normal).
+SOCIAL HISTORY (ONLY IF ASKED):
+${social || "[Not provided]"}
 
-- Medications:
-  - Salbutamol inhaler as needed.
-  - No regular cardiac medications.
-  - No recent changes in medication.
+FAMILY HISTORY (ONLY IF ASKED):
+${family || "[Not provided]"}
 
-- Allergies:
-  - None known.
+ICE (Ideas / Concerns / Expectations):
+${ice || "[Not provided]"}
 
-- Social history:
-  - Non-smoker.
-  - Drinks alcohol socially, about 6 units per week.
-  - Desk job, generally sedentary but not completely inactive.
-  - Lives with partner.
-
-- Family history:
-  - Father had a heart attack in his late 60s.
-  - No known sudden cardiac deaths in younger relatives.
-
-You MUST ONLY use information from these case details when answering questions.
-If something is not written here, you do not know it.
+REACTION / AFFECT / HOW TO ACT:
+${reaction || "[Not provided]"}
 `.trim();
 
-const SYSTEM_TEXT = `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
+  return `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
+}
 
 // ----------------------- VERTEX LIVE CONFIG -----------------------
 const VERTEX_PROJECT_ID =
   process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
 const VERTEX_LOCATION = process.env.VERTEX_LOCATION || "us-central1";
-
-// Use a current Live model ID (Vertex docs list these; example below)
 const VERTEX_MODEL_ID =
   process.env.VERTEX_MODEL_ID || "gemini-live-2.5-flash-native-audio";
 
@@ -135,26 +203,16 @@ const INPUT_MIME = "audio/pcm;rate=16000";
 const OUTPUT_EXPECTED_RATE = 24000;
 
 // ----------------------- AUTH HELPERS -----------------------
-function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
-
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
 }
 
 function loadServiceAccountCredentials() {
-  // Prefer full JSON (no base64 headaches)
   if (process.env.GOOGLE_CREDENTIALS_JSON) {
     const obj = safeJsonParse(process.env.GOOGLE_CREDENTIALS_JSON);
     if (obj) return obj;
   }
 
-  // If you truly want base64, it must decode to VALID JSON starting with "{"
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64) {
     const decoded = Buffer.from(
       process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64.replace(/^"+|"+$/g, ""),
@@ -182,16 +240,14 @@ async function getAccessToken() {
   const client = await auth.getClient();
   const tokenResponse = await client.getAccessToken();
 
-  const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
+  const token =
+    typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
   if (!token) throw new Error("Failed to obtain Google OAuth access token.");
   return token;
 }
 
 function fullyQualifiedModelName() {
   if (!VERTEX_PROJECT_ID) return null;
-
-  // Vertex Live requires publisher-model FQN
-  // Format: projects/{project}/locations/{location}/publishers/*/models/*
   return `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL_ID}`;
 }
 
@@ -207,7 +263,21 @@ app.get("/vertex", (_req, res) => {
     credsJsonPresent: !!process.env.GOOGLE_CREDENTIALS_JSON,
     credsB64Present: !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_B64,
     outputRate: OUTPUT_EXPECTED_RATE,
+    airtable: {
+      baseIdPresent: !!AIRTABLE_BASE_ID,
+      apiKeyPresent: !!AIRTABLE_API_KEY,
+    },
   });
+});
+
+// ----------------------- NEW: LIST AVAILABLE CASES -----------------------
+app.get("/cases", async (_req, res) => {
+  try {
+    const cases = await listCaseNumbersFromMeta();
+    res.json({ ok: true, cases });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
 });
 
 // ----------------------- WS PROXY -----------------------
@@ -218,28 +288,35 @@ wss.on("connection", async (clientWs) => {
   let vertexWs = null;
   let vertexReady = false;
 
-  try {
+  // We now wait for init before connecting to Vertex
+  let selectedCaseNumber = null;
+  let initReceived = false;
+
+  function sendErrorAndClose(message) {
+    try {
+      clientWs.send(JSON.stringify({ type: "error", message }));
+    } catch {}
+    try { clientWs.close(); } catch {}
+    try { vertexWs?.close(); } catch {}
+  }
+
+  async function startVertexWithCase(caseNumber) {
     const modelFqn = fullyQualifiedModelName();
-    if (!modelFqn) {
-      clientWs.send(JSON.stringify({ type: "error", message: "Missing VERTEX_PROJECT_ID/GOOGLE_CLOUD_PROJECT." }));
-      clientWs.close();
-      return;
-    }
+    if (!modelFqn) throw new Error("Missing VERTEX_PROJECT_ID/GOOGLE_CLOUD_PROJECT.");
+
+    // Fetch case from Airtable
+    const { tableName, fields } = await fetchCaseRecord(caseNumber);
+    const systemText = buildSystemTextFromCase(fields);
 
     // OAuth token (service account)
     const token = await getAccessToken();
 
-    // Connect to Vertex Live WS with Authorization header
+    // Connect to Vertex Live WS
     vertexWs = new WebSocket(VERTEX_WS_ENDPOINT, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { Authorization: `Bearer ${token}` },
     });
 
     vertexWs.on("open", () => {
-      // IMPORTANT:
-      // - model must be fully-qualified publisher model name
-      // - system_instruction must be a Content object (parts[].text)
       const setupMsg = {
         setup: {
           model: modelFqn,
@@ -247,16 +324,13 @@ wss.on("connection", async (clientWs) => {
             response_modalities: ["AUDIO"],
             temperature: 0.7,
             max_output_tokens: 512,
-            // speech_config optional (voices etc)
           },
           system_instruction: {
-            parts: [{ text: SYSTEM_TEXT }],
+            parts: [{ text: systemText }],
           },
           input_audio_transcription: {},
           output_audio_transcription: {},
-          realtime_input_config: {
-            // defaults are fine (server-side VAD)
-          },
+          realtime_input_config: {},
         },
       };
 
@@ -278,6 +352,8 @@ wss.on("connection", async (clientWs) => {
           type: "ready",
           model: modelFqn,
           outputRate: OUTPUT_EXPECTED_RATE,
+          caseId: caseNumber,
+          caseTable: tableName,
         }));
         return;
       }
@@ -285,10 +361,14 @@ wss.on("connection", async (clientWs) => {
       const serverContent = msg.serverContent || msg.server_content;
 
       // Optional transcriptions
-      const inTr = serverContent?.input_transcription?.text || serverContent?.inputTranscription?.text;
+      const inTr =
+        serverContent?.input_transcription?.text ||
+        serverContent?.inputTranscription?.text;
       if (inTr) clientWs.send(JSON.stringify({ type: "transcript", text: inTr }));
 
-      const outTr = serverContent?.output_transcription?.text || serverContent?.outputTranscription?.text;
+      const outTr =
+        serverContent?.output_transcription?.text ||
+        serverContent?.outputTranscription?.text;
       if (outTr) clientWs.send(JSON.stringify({ type: "ai_transcript", text: outTr }));
 
       // Main streamed parts
@@ -303,8 +383,11 @@ wss.on("connection", async (clientWs) => {
         if (inline?.data) {
           clientWs.send(JSON.stringify({
             type: "audio",
-            mimeType: inline.mime_type || inline.mimeType || `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
-            data: inline.data, // base64
+            mimeType:
+              inline.mime_type ||
+              inline.mimeType ||
+              `audio/pcm;rate=${OUTPUT_EXPECTED_RATE}`,
+            data: inline.data,
           }));
         }
       }
@@ -325,65 +408,96 @@ wss.on("connection", async (clientWs) => {
     });
 
     vertexWs.on("error", (err) => {
-      clientWs.send(JSON.stringify({ type: "error", message: `Vertex WS error: ${err.message}` }));
-      try { clientWs.close(); } catch {}
+      sendErrorAndClose(`Vertex WS error: ${err.message}`);
     });
+  }
 
-    // Browser -> Vertex
-    clientWs.on("message", (payload, isBinary) => {
-      if (!vertexWs || vertexWs.readyState !== WebSocket.OPEN) return;
-      if (!vertexReady) return;
+  // Browser -> Server
+  clientWs.on("message", async (payload, isBinary) => {
+    // Block binary audio until init & vertex ready
+    if (isBinary) {
+      if (!initReceived || !vertexWs || vertexWs.readyState !== WebSocket.OPEN || !vertexReady) return;
 
-      if (isBinary) {
-        // Vertex Live expects realtime_input.media_chunks[]
-        const audioMsg = {
-          realtime_input: {
-            media_chunks: [
-              {
-                mime_type: INPUT_MIME,
-                data: toBase64(payload),
-              },
-            ],
-          },
-        };
-        vertexWs.send(JSON.stringify(audioMsg));
+      const audioMsg = {
+        realtime_input: {
+          media_chunks: [
+            {
+              mime_type: INPUT_MIME,
+              data: toBase64(payload),
+            },
+          ],
+        },
+      };
+      vertexWs.send(JSON.stringify(audioMsg));
+      return;
+    }
+
+    const text = payload.toString("utf8");
+    const msg = safeJsonParse(text);
+    if (!msg) return;
+
+    // NEW: init message selects case
+    if (msg.type === "init") {
+      if (initReceived) return; // ignore repeats
+
+      const caseId = Number(msg.caseId);
+      if (!Number.isFinite(caseId) || caseId <= 0) {
+        sendErrorAndClose(`Invalid caseId in init: ${msg.caseId}`);
         return;
       }
 
-      const text = payload.toString("utf8");
-      const msg = safeJsonParse(text);
-      if (!msg) return;
+      initReceived = true;
+      selectedCaseNumber = caseId;
 
-      if (msg.type === "text" && typeof msg.text === "string") {
-        // Send as client_content update
-        const clientContentMsg = {
-          client_content: {
-            turns: [{ role: "user", parts: [{ text: msg.text }] }],
-            turn_complete: true,
-          },
-        };
-        vertexWs.send(JSON.stringify(clientContentMsg));
+      try {
+        await startVertexWithCase(selectedCaseNumber);
+      } catch (e) {
+        sendErrorAndClose(e.message || String(e));
       }
+      return;
+    }
 
-      if (msg.type === "stop_audio") {
-        // Safe: just end connection from our side
-        try { vertexWs.close(); } catch {}
-      }
-    });
-
-    clientWs.on("close", () => {
+    // Allow stop_audio even before init
+    if (msg.type === "stop_audio") {
       try { vertexWs?.close(); } catch {}
-    });
+      return;
+    }
 
-    clientWs.on("error", () => {
-      try { vertexWs?.close(); } catch {}
-    });
+    // Text chat support (optional) after ready
+    if (msg.type === "text" && typeof msg.text === "string") {
+      if (!initReceived || !vertexWs || vertexWs.readyState !== WebSocket.OPEN || !vertexReady) return;
 
-  } catch (err) {
-    clientWs.send(JSON.stringify({ type: "error", message: err.message || String(err) }));
-    try { clientWs.close(); } catch {}
+      const clientContentMsg = {
+        client_content: {
+          turns: [{ role: "user", parts: [{ text: msg.text }] }],
+          turn_complete: true,
+        },
+      };
+      vertexWs.send(JSON.stringify(clientContentMsg));
+      return;
+    }
+  });
+
+  clientWs.on("close", () => {
     try { vertexWs?.close(); } catch {}
-  }
+  });
+
+  clientWs.on("error", () => {
+    try { vertexWs?.close(); } catch {}
+  });
+
+  // Gentle reminder if frontend forgets to init
+  setTimeout(() => {
+    if (!initReceived) {
+      try {
+        clientWs.send(JSON.stringify({
+          type: "error",
+          message: "No init received. Send {type:'init', caseId:<number>} right after WS open.",
+        }));
+      } catch {}
+      try { clientWs.close(); } catch {}
+    }
+  }, 15000);
 });
 
 server.listen(PORT, () => {
