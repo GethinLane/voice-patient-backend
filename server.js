@@ -68,20 +68,56 @@ async function listCaseNumbersFromMeta() {
   return nums;
 }
 
-// Fetch first record from table "Case X"
-async function fetchCaseRecord(caseNumber) {
+async function fetchAllCaseRows(caseNumber) {
   const tableName = `Case ${caseNumber}`;
-  const url =
-    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/` +
-    `${encodeURIComponent(tableName)}?pageSize=1`;
 
-  const json = await airtableFetch(url);
-  const rec = (json.records || [])[0];
-  if (!rec || !rec.fields) {
+  // Optional: if you create a view in Airtable called "AI" that orders rows correctly,
+  // uncomment the next line and include &view=AI in the URL.
+  // const viewName = "AI";
+
+  let offset = null;
+  const records = [];
+
+  do {
+    const params = new URLSearchParams();
+    params.set("pageSize", "100");
+    // params.set("view", viewName); // optional if you make a view
+
+    if (offset) params.set("offset", offset);
+
+    const url =
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/` +
+      `${encodeURIComponent(tableName)}?${params.toString()}`;
+
+    const json = await airtableFetch(url);
+    records.push(...(json.records || []));
+    offset = json.offset || null;
+  } while (offset);
+
+  if (!records.length) {
     throw new Error(`No records found in Airtable table "${tableName}".`);
   }
-  return { tableName, recordId: rec.id, fields: rec.fields };
+
+  return { tableName, records };
 }
+
+function combineFieldAcrossRows(records, fieldName) {
+  // Airtable returns records in view order (or default order).
+  // We combine non-empty field values in that order.
+  const parts = [];
+  for (const r of records) {
+    const v = r?.fields?.[fieldName];
+    if (typeof v === "string") {
+      const t = v.trim();
+      if (t) parts.push(t);
+    } else if (v != null) {
+      const t = String(v).trim();
+      if (t) parts.push(t);
+    }
+  }
+  return parts.join("\n\n"); // separate rows clearly
+}
+
 
 function fieldStr(fields, name) {
   const v = fields?.[name];
