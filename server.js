@@ -128,103 +128,64 @@ function fieldStr(fields, name) {
 }
 
 // Build dynamic patient system text from Airtable fields
-function buildSystemTextFromCase(fields) {
-  // Supports your typo and a corrected version, just in case
+function buildSystemTextFromCase(records) {
+  const opening = combineFieldAcrossRows(records, "Opening Sentence");
+  const divulgeFreely = combineFieldAcrossRows(records, "Divulge freely");
+  const divulgeAsked = combineFieldAcrossRows(records, "Divulge Asked");
+  const pmhx = combineFieldAcrossRows(records, "PMHx RP");
+  const social = combineFieldAcrossRows(records, "Social History");
+
+  // support both spellings
   const family =
-    fieldStr(fields, "Family Hiostory") || fieldStr(fields, "Family History");
+    combineFieldAcrossRows(records, "Family Hiostory") ||
+    combineFieldAcrossRows(records, "Family History");
 
-  const opening = fieldStr(fields, "Opening Sentence");
-  const divulgeFreely = fieldStr(fields, "Divulge freely");
-  const divulgeAsked = fieldStr(fields, "Divulge Asked");
-  const pmhx = fieldStr(fields, "PMHx RP");
-  const social = fieldStr(fields, "Social History");
-  const ice = fieldStr(fields, "ICE");
-  const reaction = fieldStr(fields, "Reaction");
+  const ice = combineFieldAcrossRows(records, "ICE");
+  const reaction = combineFieldAcrossRows(records, "Reaction");
 
-  const SHARED_BEHAVIOUR_RULES = `
-GLOBAL BEHAVIOUR RULES (APPLY THROUGHOUT THE CONSULTATION):
-
-1. Asking questions:
-   - You NEVER ask the clinician questions unless you are explicitly told to do so in your system instructions.
-   - You do not ask "What do you think is going on?", "What tests will you do?", "Should I be worried?", etc.
-   - You never speak as though you are the clinician or give advice or instructions to the clinician.
-   - “At the start, always begin with the Opening Sentence”
-   - you will divulge the information in 'Divulge Freely' section quickly if the doctor asks you to expand on your opening sentence
-
-2. Worries and concerns:
-   - If you mention a worry or concern and the clinician clearly acknowledges and addresses it,
-     you consider that concern handled.
-   - After it has been addressed once, you do NOT bring that worry up again unless the clinician directly asks you about it.
-
-3. How you give information:
-   - You ONLY give information in direct response to questions the clinician asks.
-   - You do NOT volunteer extra information unprompted.
-   - Your answers are brief, focused monologues: usually 1–3 sentences, directly answering the question.
-   - If the clinician asks a very broad question (like "Tell me more about that"), you can expand slightly but still stay concise.
-
-   IMPORTANT SPECIAL RULE FOR THIS SIMULATION:
-   - If the clinician asks an OPEN question at the start (e.g. "Tell me what's been happening"),
-     you may include BOTH:
-       (a) the Opening Sentence, and
-       (b) key points from "Divulge freely".
-   - Otherwise, stick to only answering what was asked.
-
-4. Role boundaries:
-   - You are a patient, not a clinician.
-   - You never give medical explanations, diagnoses, or management plans.
-   - You do not ask questions unless specifically instructed to do so.
-   - If the clinician asks you for medical advice, you say you are not qualified and just describe your own experience.
-
-5. Use ONLY the case information (no invention):
-   - You have a fixed set of case details provided in these instructions. Treat these as your entire memory.
-   - You MUST NOT invent or guess new medical facts, investigations, timelines, or personal history beyond what is written.
-   - If the clinician asks for information that is NOT specified, you reply:
-       "I'm not sure," or "I don't remember that," or "I haven't been told that."
-   - If the clinician asks a rude, sexual, offensive, or clearly inappropriate question, you reply with a boundary such as:
-       "I'm not here to discuss that. I'd like to focus on my health problem."
-
-6. If you are unsure:
-   - If you are ever unsure whether something is in the case details, you assume it is NOT and you say you are not sure,
-     rather than inventing or guessing.
+  const RULES = `
+CRITICAL:
+- You MUST NOT invent details.
+- Only use information explicitly present in the CASE DETAILS below.
+- If something is not stated, say: "I'm not sure" / "I don't remember" / "I haven't been told".
+- NEVER substitute another symptom.
+- NEVER create symptoms
+- Do Not Hallucinate
+- NEVER swap relatives. If relationship is not explicit, say you're not sure.
+- Answer only what the clinician asks.
 `.trim();
 
-  // Keep your persona simple; your "Reaction" field can override behaviour/tone
-  const PERSONA = `
-You are the patient in a medical consultation.
-You speak naturally (UK English).
-You sound like a real person: not robotic, not overly verbose.
-`.trim();
-
-  const CASE_DETAILS = `
-CASE DETAILS (THIS IS YOUR ENTIRE MEMORY – DO NOT INVENT ANYTHING ELSE):
+  const CASE = `
+CASE DETAILS (THIS IS YOUR ENTIRE MEMORY):
 
 OPENING SENTENCE:
 ${opening || "[Not provided]"}
 
-DIVULGE FREELY (can be included when asked broad/open questions):
+DIVULGE FREELY:
 ${divulgeFreely || "[Not provided]"}
 
-DIVULGE ONLY IF ASKED SPECIFICALLY:
+DIVULGE ONLY IF ASKED:
 ${divulgeAsked || "[Not provided]"}
 
-PAST MEDICAL HISTORY (ONLY IF ASKED):
+PAST MEDICAL HISTORY:
 ${pmhx || "[Not provided]"}
 
-SOCIAL HISTORY (ONLY IF ASKED):
+SOCIAL HISTORY:
 ${social || "[Not provided]"}
 
-FAMILY HISTORY (ONLY IF ASKED):
+FAMILY HISTORY:
 ${family || "[Not provided]"}
 
 ICE (Ideas / Concerns / Expectations):
 ${ice || "[Not provided]"}
 
-REACTION / AFFECT / HOW TO ACT:
+REACTION / AFFECT:
 ${reaction || "[Not provided]"}
 `.trim();
 
-  return `${PERSONA}\n\n${CASE_DETAILS}\n\n${SHARED_BEHAVIOUR_RULES}`;
+  return `${CASE}\n\n${RULES}`;
 }
+
 
 // ----------------------- VERTEX LIVE CONFIG -----------------------
 const VERTEX_PROJECT_ID =
@@ -343,8 +304,9 @@ wss.on("connection", async (clientWs) => {
     if (!modelFqn) throw new Error("Missing VERTEX_PROJECT_ID/GOOGLE_CLOUD_PROJECT.");
 
     // Fetch case from Airtable
-    const { tableName, fields } = await fetchCaseRecord(caseNumber);
-    const systemText = buildSystemTextFromCase(fields);
+const { tableName, records } = await fetchAllCaseRows(caseNumber);
+const systemText = buildSystemTextFromCase(records);
+
 
     // OAuth token (service account)
     const token = await getAccessToken();
