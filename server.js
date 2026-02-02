@@ -328,7 +328,7 @@ wss.on("connection", async (clientWs) => {
           model: modelFqn,
           generation_config: {
             // Option 4: include TEXT too for debugging
-            response_modalities: ["AUDIO", "TEXT"],
+            response_modalities: ["AUDIO"],
             temperature: 0.2,
             max_output_tokens: 512,
           },
